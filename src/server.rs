@@ -1,26 +1,37 @@
 use std::{
     fs::{self},
     io::{self, Error, ErrorKind, Read},
-    net::TcpStream,
     path::Path,
 };
 
 use byteorder::{BigEndian, ByteOrder};
 use crc32fast::Hasher;
-use tracing::{debug, error};
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+};
+use tracing::{debug, error, info};
 
 static ROOT_SAVING_DIRECTORY: &str = "/Users/vikaspathania/Downloads/Backup";
 
 /// Creating this for unit tests
 pub trait ReadFromStream {
     // Using Vec<u8> for help in unit testing
-    fn read_data(&mut self, buf: &mut Vec<u8>, valid_read_index: usize) -> io::Result<usize>;
+    async fn read_data(
+        &mut self,
+        buf: &mut Vec<u8>,
+        valid_read_index: usize,
+    ) -> Result<usize, std::io::Error>;
 }
 
 impl ReadFromStream for TcpStream {
-    fn read_data(&mut self, buf: &mut Vec<u8>, valid_read_index: usize) -> io::Result<usize> {
+    async fn read_data(
+        &mut self,
+        buf: &mut Vec<u8>,
+        valid_read_index: usize,
+    ) -> Result<usize, std::io::Error> {
         // We need to append data after the valid_read_index.
-        self.read(&mut buf[valid_read_index..])
+        self.read(&mut buf[valid_read_index..]).await
     }
 }
 
@@ -54,8 +65,8 @@ impl Server {
     /// - compute and compare checksum
     /// - create folder
     ///
-    pub fn create_folder(
-        socket: &mut dyn ReadFromStream,
+    pub async fn create_folder<T: ReadFromStream>(
+        mut socket: T,
         buf: &mut Vec<u8>,
         // Usually buf.len() if buf is of type vector. But if buf is of type fixed array, then buf.len() will
         // give size of array, whereas this will tell the index of last readable byte. Bytes after this will be garbage
@@ -78,6 +89,7 @@ impl Server {
                 // Read more bytes
                 let n = socket
                     .read_data(buf, valid_read_index)
+                    .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
                     // We have no data from stream, return error
@@ -112,6 +124,7 @@ impl Server {
                 // Read more bytes
                 let n = socket
                     .read_data(buf, valid_read_index)
+                    .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
                     // We have no data from stream, return error
@@ -167,6 +180,7 @@ impl Server {
             if valid_read_index - current_processed_index < checsum_bytes_length {
                 let n = socket
                     .read_data(buf, valid_read_index)
+                    .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
                     // We have no data from stream, return error
@@ -228,46 +242,48 @@ impl Server {
 
     // pub fn save_file(socket: &TcpStream, buf: &Vec<u8>) -> io::Result<()> {}
 
-    // pub async fn run(&self) -> Result<(), Box<dyn Error>> {
-    //     let addr = self.server_address();
-    //     let listener = TcpListener::bind(&addr).await?;
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = self.server_address();
+        let listener = TcpListener::bind(&addr).await?;
 
-    //     info!("Server started on ip: {}", addr);
+        info!("Server started on ip: {}", addr);
 
-    //     loop {
-    //         // Asynchronously wait for an inbound socket.
-    //         let (mut socket, _) = listener.accept().await?;
+        loop {
+            // Asynchronously wait for an inbound socket.
+            let (mut socket, _) = listener.accept().await?;
 
-    //         debug!("Received request");
-    //         tokio::spawn(async move {
-    //             let mut buf = vec![0; 1024];
+            debug!("Received request");
+            tokio::spawn(async move {
+                let mut buf = vec![0; 1024];
 
-    //             let n = socket
-    //                 .read(&mut buf)
-    //                 .await
-    //                 .expect("failed to read data from socket");
+                let n = socket
+                    .read(&mut buf)
+                    .await
+                    .expect("failed to read data from socket");
 
-    //             // Connection created but no data end the request.
-    //             if n <= 0 {
-    //                 error!("{n} bytes found for request, closing connection");
-    //                 return;
-    //             }
+                // Connection created but no data, end the request.
+                if n <= 0 {
+                    error!("{n} bytes found for request, closing connection");
+                    return;
+                }
 
-    //             // First byte is [`Operation`] byte either 01 or 02
-    //             if buf[0] == Operation::CreateFolder as u8 {
-    //                 match Self::create_folder(socket, &buf) {
-    //                     Ok(_) => debug!("Folder created sucesfully"),
-    //                     Err(_) => error!("Folder failed to create, read debug logs"),
-    //                 }
-    //             } else if buf[0] == Operation::SaveFile as u8 {
-    //                 save_file(socket, buf);
-    //             } else {
-    //                 error!("Unknown operation {:?}. closing connection", buf[0]);
-    //                 return;
-    //             }
-    //         });
-    //     }
-    // }
+                // First byte is [`Operation`] byte either 01 or 02
+                if buf[0] & Operation::CreateFolder as u8 == 1 {
+                    match Self::create_folder(socket, &mut buf, n, 1).await {
+                        Ok(_) => debug!("Folder created sucesfully"),
+                        Err(_) => error!("Folder failed to create, read debug logs"),
+                    }
+                } else if buf[0] == Operation::SaveFile as u8 {
+                    // save_file(socket, buf);
+                    error!("Not Implemented");
+                    return;
+                } else {
+                    error!("Unknown operation {:?}. closing connection", buf[0]);
+                    return;
+                }
+            });
+        }
+    }
 
     fn server_address(&self) -> String {
         self.ip.clone() + ":" + self.port.to_string().as_str()
@@ -277,7 +293,6 @@ impl Server {
 #[cfg(test)]
 mod tests {
 
-    
     use crc32fast::Hasher;
     use std::sync::Once;
     use tracing::debug;
@@ -297,11 +312,11 @@ mod tests {
     struct TcpStreamTestStreamNoData {}
 
     impl ReadFromStream for TcpStreamTestStreamNoData {
-        fn read_data(
+        async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
             valid_read_index: usize,
-        ) -> std::io::Result<usize> {
+        ) -> Result<usize, std::io::Error> {
             Ok(0)
         }
     }
@@ -310,11 +325,11 @@ mod tests {
 
     impl ReadFromStream for TcpStreamTestStreamAllData {
         // This will fill buffer with folder_name and its metadata
-        fn read_data(
+        async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
             valid_read_index: usize,
-        ) -> std::io::Result<usize> {
+        ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
             buf.extend_from_slice(&get_folder_length_bytes(folder_name_bytes.clone()));
@@ -333,11 +348,11 @@ mod tests {
     struct TcpStreamTestStreamWriteFolderNameAndChecksum {}
 
     impl ReadFromStream for TcpStreamTestStreamWriteFolderNameAndChecksum {
-        fn read_data(
+        async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
             valid_read_index: usize,
-        ) -> std::io::Result<usize> {
+        ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
             buf.extend_from_slice(&folder_name_bytes);
@@ -349,11 +364,11 @@ mod tests {
     struct TcpStreamTestStreamWriteChecksum {}
 
     impl ReadFromStream for TcpStreamTestStreamWriteChecksum {
-        fn read_data(
+        async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
             valid_read_index: usize,
-        ) -> std::io::Result<usize> {
+        ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
             buf.extend_from_slice(&get_checksum_bytes(folder_name_bytes));
@@ -378,8 +393,8 @@ mod tests {
         "/This/is/the/test/folderऐक".as_bytes().to_vec()
     }
 
-    #[test]
-    fn test_create_folder_ok_read_data_from_stream() {
+    #[tokio::test]
+    async fn test_create_folder_ok_read_data_from_stream() {
         initialize();
         let mut test_stream = TcpStreamTestStreamAllData {};
 
@@ -393,7 +408,7 @@ mod tests {
         let number_of_bytes_read = buf.len();
         debug!("Buf created for test {:#?}", String::from_utf8(buf.clone()));
 
-        match Server::create_folder(&mut test_stream, &mut buf, number_of_bytes_read, 1) {
+        match Server::create_folder(test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((bytes_processed, bytes_read)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
                 assert_eq!(bytes_processed, number_of_bytes_read);
@@ -409,15 +424,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_folder_ok_no_read_from_stream() {
+    #[tokio::test]
+    async fn test_create_folder_ok_no_read_from_stream() {
         initialize();
 
         let mut test_stream = TcpStreamTestStreamAllData {};
 
         let mut buf = vec![0b00000001u8];
         let number_of_bytes_read = buf.len();
-        match Server::create_folder(&mut test_stream, &mut buf, number_of_bytes_read, 1) {
+        match Server::create_folder(test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((bytes_processed, bytes_read)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
                 assert_eq!(bytes_processed, buf.len());
@@ -433,8 +448,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_folder_ok_read_folder_name_and_checksum_from_stream() {
+    #[tokio::test]
+    async fn test_create_folder_ok_read_folder_name_and_checksum_from_stream() {
         initialize();
 
         let mut test_stream = TcpStreamTestStreamWriteFolderNameAndChecksum {};
@@ -444,7 +459,7 @@ mod tests {
         buf.extend_from_slice(&get_folder_length_bytes(folder_name_bytes.clone()));
 
         let number_of_bytes_read = buf.len();
-        match Server::create_folder(&mut test_stream, &mut buf, number_of_bytes_read, 1) {
+        match Server::create_folder(test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((bytes_processed, bytes_read)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
                 assert_eq!(bytes_processed, buf.len());
@@ -460,8 +475,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_folder_ok_read_checksum_from_stream() {
+    #[tokio::test]
+    async fn test_create_folder_ok_read_checksum_from_stream() {
         initialize();
 
         let mut test_stream = TcpStreamTestStreamWriteChecksum {};
@@ -472,7 +487,7 @@ mod tests {
         buf.extend_from_slice(&folder_name_bytes.clone());
 
         let number_of_bytes_read = buf.len();
-        match Server::create_folder(&mut test_stream, &mut buf, number_of_bytes_read, 1) {
+        match Server::create_folder(test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((bytes_processed, bytes_read)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
                 assert_eq!(bytes_processed, buf.len());
@@ -488,15 +503,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_folder_erro_read_stream() {
+    #[tokio::test]
+    async fn test_create_folder_erro_read_stream() {
         initialize();
 
-        let mut test_stream = TcpStreamTestStreamNoData {};
+        let test_stream = TcpStreamTestStreamNoData {};
 
         let mut buf = vec![0b00000001u8];
         let number_of_bytes_read = buf.len();
-        match Server::create_folder(&mut test_stream, &mut buf, number_of_bytes_read, 1) {
+        match Server::create_folder(test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((bytes_processed, bytes_read)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
                 assert_eq!(bytes_processed, buf.len());
