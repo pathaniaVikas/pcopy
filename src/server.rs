@@ -1,6 +1,6 @@
 use std::{
     fs::{self},
-    io::{self, Error, ErrorKind, Read},
+    io::{Error, ErrorKind, Read},
     path::Path,
 };
 
@@ -314,8 +314,8 @@ mod tests {
     impl ReadFromStream for TcpStreamTestStreamNoData {
         async fn read_data(
             &mut self,
-            buf: &mut Vec<u8>,
-            valid_read_index: usize,
+            _buf: &mut Vec<u8>,
+            _valid_read_index: usize,
         ) -> Result<usize, std::io::Error> {
             Ok(0)
         }
@@ -328,7 +328,7 @@ mod tests {
         async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
-            valid_read_index: usize,
+            _valid_read_index: usize,
         ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
@@ -351,7 +351,7 @@ mod tests {
         async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
-            valid_read_index: usize,
+            _valid_read_index: usize,
         ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
@@ -367,7 +367,7 @@ mod tests {
         async fn read_data(
             &mut self,
             buf: &mut Vec<u8>,
-            valid_read_index: usize,
+            _valid_read_index: usize,
         ) -> Result<usize, std::io::Error> {
             let initial_buf_len = buf.len();
             let folder_name_bytes = get_folder_name_bytes();
@@ -396,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_folder_ok_read_data_from_stream() {
         initialize();
-        let mut test_stream = TcpStreamTestStreamAllData {};
+        let test_stream = TcpStreamTestStreamAllData {};
 
         let mut buf = vec![0b00000001u8];
 
@@ -428,7 +428,7 @@ mod tests {
     async fn test_create_folder_ok_no_read_from_stream() {
         initialize();
 
-        let mut test_stream = TcpStreamTestStreamAllData {};
+        let test_stream = TcpStreamTestStreamAllData {};
 
         let mut buf = vec![0b00000001u8];
         let number_of_bytes_read = buf.len();
@@ -452,7 +452,7 @@ mod tests {
     async fn test_create_folder_ok_read_folder_name_and_checksum_from_stream() {
         initialize();
 
-        let mut test_stream = TcpStreamTestStreamWriteFolderNameAndChecksum {};
+        let test_stream = TcpStreamTestStreamWriteFolderNameAndChecksum {};
 
         let mut buf = vec![0b00000001u8];
         let folder_name_bytes = get_folder_name_bytes();
@@ -479,7 +479,7 @@ mod tests {
     async fn test_create_folder_ok_read_checksum_from_stream() {
         initialize();
 
-        let mut test_stream = TcpStreamTestStreamWriteChecksum {};
+        let test_stream = TcpStreamTestStreamWriteChecksum {};
 
         let mut buf = vec![0b00000001u8];
         let folder_name_bytes = get_folder_name_bytes();
