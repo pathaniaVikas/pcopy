@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, DirEntry, File},
+    fs::{self, DirEntry},
     io::{self, Read, Write},
     net::TcpStream,
     path::Path,
@@ -48,7 +48,7 @@ impl Client {
                         break;
                     }
                 }
-                Err(error) => print!("{}", error.to_string()),
+                Err(error) => print!("{}", error),
             }
         }
         //

@@ -8,7 +8,6 @@ use std::{
 use byteorder::{BigEndian, ByteOrder};
 use crc32fast::Hasher;
 use tracing::{debug, error};
-use tracing_subscriber::field::debug;
 
 static ROOT_SAVING_DIRECTORY: &str = "/Users/vikaspathania/Downloads/Backup";
 
@@ -224,7 +223,7 @@ impl Server {
             current_processed_index, valid_read_index
         );
 
-        return Ok((current_processed_index, valid_read_index));
+        Ok((current_processed_index, valid_read_index))
     }
 
     // pub fn save_file(socket: &TcpStream, buf: &Vec<u8>) -> io::Result<()> {}
@@ -278,12 +277,9 @@ impl Server {
 #[cfg(test)]
 mod tests {
 
-    use bytes::{BufMut, BytesMut};
+    
     use crc32fast::Hasher;
-    use std::{
-        io::{BorrowedBuf, Read, Write},
-        sync::Once,
-    };
+    use std::sync::Once;
     use tracing::debug;
 
     use super::{ReadFromStream, Server};
