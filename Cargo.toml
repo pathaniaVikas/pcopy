@@ -1,0 +1,12 @@
+[package]
+name = "fileserver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+crc32fast = "1"
+byteorder = "1"
+bytes = "1"
