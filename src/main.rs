@@ -1,8 +1,8 @@
 #![feature(core_io_borrowed_buf)]
-use std::{env, error::Error, path::Path};
 
 use client::Client;
 use server::Server;
+use std::{env, error::Error, path::Path};
 use tokio::{io::AsyncReadExt, net::TcpListener};
 use tracing::{error, info};
 
@@ -51,7 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if run_as.to_lowercase() == "server".to_string() {
         let ip = "127.0.0.1".to_string();
         let port = 8888;
-
         let server = Server::init(ip, port);
         server.run().await;
         Result::Ok(())
