@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.send_folder(Path::new(path));
         Ok(())
     } else if run_as.to_lowercase() == "server".to_string() {
-        let ip = "127.0.0.1".to_string();
+        let ip = "10.0.0.139".to_string();
         let port = 8888;
         let server = Server::init(ip, port);
         server.run().await;

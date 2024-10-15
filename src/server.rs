@@ -452,8 +452,10 @@ impl Server {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!(
-                    "Computed checksum {} and received checksum {} do not match",
-                    expected_checksum, received_checksum
+                    "Computed checksum {} and received checksum {} do not match for file {}",
+                    expected_checksum,
+                    received_checksum,
+                    file_path.unwrap()
                 ),
             ));
         }

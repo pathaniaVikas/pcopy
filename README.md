@@ -28,3 +28,5 @@ You can run client as much time giving the different folder names you want to co
     - To avoid data loss, copy over two locations.
     - provide encryption support (Authentication keys)
 - add peer to peer storage selective nodes
+- use connection pool
+- use queue and threads to process multiple requests

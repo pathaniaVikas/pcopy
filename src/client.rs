@@ -10,7 +10,7 @@ use std::{
 };
 
 use crc32fast::Hasher;
-use tracing::{debug, error, info};
+use tracing::{debug, error, field::debug, info};
 use walkdir::WalkDir;
 
 pub struct Client {
@@ -90,7 +90,10 @@ impl Client {
         let mut file_checksum_hasher = Hasher::new();
         file_checksum_hasher.update(&buf[current_read_index..]);
 
-        stream.write_all(&buf);
+        match stream.write_all(&buf) {
+            Ok(_) => debug!("First request buffer written to server"),
+            Err(e) => debug!("Error while writing first buffer {}", e),
+        };
 
         loop {
             // debug!("Before buffer length {}", buf.len());
