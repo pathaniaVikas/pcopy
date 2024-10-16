@@ -10,6 +10,7 @@ use std::{
 use byteorder::{BigEndian, ByteOrder};
 use bytes::Buf;
 use crc32fast::Hasher;
+use iced::widget::shader::wgpu::naga::valid;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -274,6 +275,7 @@ impl Server {
             valid_read_index
         );
 
+        // debug!("Buf {:#?}", buf);
         let mut file_path: Option<String> = Option::None;
         match Self::create_parent_folder(socket, buf, valid_read_index, current_processed_index)
             .await
@@ -315,7 +317,7 @@ impl Server {
             }
         }
 
-        let mut file_data_length = BigEndian::read_u32(
+        let mut file_data_to_read = BigEndian::read_u32(
             &buf[current_processed_index..current_processed_index + data_length_bytes],
         );
 
@@ -327,7 +329,7 @@ impl Server {
             valid_read_index
         );
 
-        debug!("File will have {} bytes", file_data_length);
+        debug!("File will have {} bytes", file_data_to_read);
 
         // create a new file to write data
         if file_path.is_none() {
@@ -346,23 +348,28 @@ impl Server {
 
         // If file is small and can fit in < 1023 bytes, we need to read till that index
         let file_data_end_index = min(
-            current_processed_index + file_data_length as usize,
+            current_processed_index + file_data_to_read as usize,
             valid_read_index,
         );
 
+        debug!("Reading first buffer data from {current_processed_index} to {file_data_end_index}");
         let mut total_file_data_bytes_read = file
             .write(&buf[current_processed_index..file_data_end_index])
             .unwrap();
+        debug!("Total bytes read from initial buffer {total_file_data_bytes_read}");
+
         expected_checksum_hasher.update(&buf[current_processed_index..file_data_end_index]);
-        file_data_length -= (file_data_end_index - current_processed_index) as u32;
+
+        file_data_to_read -= total_file_data_bytes_read as u32;
+
         current_processed_index = file_data_end_index;
 
         debug!(
-            "CurrentProcessedIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataLength {file_data_length}"
+            "CurrentProcessedIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataRemaining {file_data_to_read}"
         );
 
         loop {
-            if (valid_read_index - current_processed_index) < file_data_length as usize {
+            if (valid_read_index - current_processed_index) < file_data_to_read as usize {
                 // IF we have read all data in buffer, reset indexes
                 if current_processed_index == buf.len() {
                     // Now we can reset our pointers to use whole buffer for reading data from stream
@@ -374,7 +381,10 @@ impl Server {
                 let n = socket
                     .read_data(buf, valid_read_index)
                     .await
-                    .expect("failed to read data from socket");
+                    .expect(&format!(
+                        "failed to read data from socket, cpi: {}, vri: {}, fdl: {}",
+                        current_processed_index, valid_read_index, file_data_to_read
+                    ));
                 if n <= 0 {
                     // We have no data from stream, return error
                     return Err(Error::new(
@@ -387,6 +397,8 @@ impl Server {
                 }
 
                 valid_read_index += n;
+                // total_file_data_bytes_read += n;
+                // file_data_to_read -= n as u32;
 
                 // if we have read more than remaining file length bytes from stream.
                 // It means we have read bytes of checksum too in same buffer
@@ -396,33 +408,37 @@ impl Server {
                 //                                  |file_data_bytes|checksum bits|
                 // current_processed_index is here ->                              <- valid_read_index is here
                 // Then write only file data bytes to file
-                if valid_read_index > current_processed_index + file_data_length as usize {
-                    debug!("Writing last file data chunk. CurrentProcessIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataLength {file_data_length}");
+                if valid_read_index > current_processed_index + file_data_to_read as usize {
+                    debug!("Writing last file data chunk. CurrentProcessIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataLengthRemainig {file_data_to_read}, TotalBytesRead {total_file_data_bytes_read}");
                     let current_data_slice = &buf[current_processed_index
-                        ..current_processed_index + file_data_length as usize];
+                        ..current_processed_index + file_data_to_read as usize];
 
-                    total_file_data_bytes_read += file.write(current_data_slice)?;
-
+                    file.write_all(current_data_slice)?;
+                    // file.flush().unwrap();
                     expected_checksum_hasher.update(current_data_slice);
 
-                    current_processed_index += file_data_length as usize;
+                    current_processed_index += file_data_to_read as usize;
 
+                    total_file_data_bytes_read += file_data_to_read as usize;
                     // TODO: Should we use u32 instead of usize
-                    file_data_length -= current_processed_index as u32;
-
+                    file_data_to_read -= current_processed_index as u32;
                     // File data length should be zero here
-                    assert!(file_data_length == 0);
+                    assert!(file_data_to_read == 0);
                 } else {
                     let current_data_slice = &buf[current_processed_index..valid_read_index];
 
                     // TODO: It can panic here: read result and return error
-                    total_file_data_bytes_read += file.write(current_data_slice).unwrap();
-
+                    file.write_all(current_data_slice).unwrap();
+                    // file.flush().unwrap(); // TODO do we need to flush everytime ?
                     expected_checksum_hasher.update(current_data_slice);
 
-                    current_processed_index = valid_read_index;
-                    file_data_length -= current_processed_index as u32; // TODO: Should we use u32 instead of usize
+                    current_processed_index += n;
+
+                    total_file_data_bytes_read += n;
+                    file_data_to_read -= n as u32;
                 }
+
+                // debug!("cpi {current_processed_index}, vri {valid_read_index}, n {n}, tbr {total_file_data_bytes_read}");
 
                 // debug!("File bytes read {}", total_file_data_bytes_read);
             } else {
@@ -565,6 +581,11 @@ async fn read_checksum<T: ReadFromStream>(
             break;
         }
     }
+
+    debug!(
+        "Checksum bytes: {:#?} from {current_processed_index}",
+        &buf[*current_processed_index..*current_processed_index + checksum_bytes_length]
+    );
     let received_checksum = Hasher::new_with_initial(BigEndian::read_u32(
         &buf[*current_processed_index..*current_processed_index + checksum_bytes_length],
     ))

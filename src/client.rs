@@ -109,6 +109,7 @@ impl Client {
 
         // write checksum
         stream.write_all(&file_checksum_hasher.finalize().to_be_bytes());
+        stream.flush().unwrap();
 
         // Check server status of file writing
         let mut result_buff = [0b00000000u8; 2];
