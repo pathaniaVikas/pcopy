@@ -77,20 +77,21 @@ impl Client {
         debug!("File data length bytes {}", file_data_len);
         buf.extend_from_slice(&file_data_len.to_be_bytes().to_vec());
 
-        let current_read_index = buf.len();
-
+        let mut current_read_index = buf.len();
+        let mut file_bytes_read_total = 0;
         // expand buf to be of 1024 length
         buf.resize(1024, 0b00000000u8);
         assert!(buf.len() == 1024);
 
         // Fill remaining bytes in buffer with file data
-        file.read(&mut buf[current_read_index..]).unwrap();
-
+        let n = file.read(&mut buf[current_read_index..]).unwrap();
         // initiate checksum computer
         let mut file_checksum_hasher = Hasher::new();
-        file_checksum_hasher.update(&buf[current_read_index..]);
+        file_checksum_hasher.update(&buf[current_read_index..current_read_index + n]);
+        file_bytes_read_total += n;
+        current_read_index += n;
 
-        match stream.write_all(&buf) {
+        match stream.write_all(&buf[0..current_read_index]) {
             Ok(_) => debug!("First request buffer written to server"),
             Err(e) => debug!("Error while writing first buffer {}", e),
         };
@@ -100,32 +101,37 @@ impl Client {
             // Read from file and fill buffer's 1024 bytes again
             let n = file.read(&mut buf[0..]).unwrap();
             // debug!("After buffer length {}", buf.len());
-            if n <= 0 {
+            if n == 0 {
                 break;
             }
             stream.write_all(&buf[0..n]);
+            debug!("{n} bytes written to stream");
+            stream.flush().unwrap();
             file_checksum_hasher.update(&buf[0..n]);
+            file_bytes_read_total += n;
         }
 
+        debug!("Total file bytes read {file_bytes_read_total}");
         // write checksum
-        stream.write_all(&file_checksum_hasher.finalize().to_be_bytes());
+        let checksum = file_checksum_hasher.finalize();
+        debug!("Checksum {:?}", checksum.to_be_bytes());
+        let _ = stream.write_all(&checksum.to_be_bytes());
         stream.flush().unwrap();
-
         // Check server status of file writing
-        let mut result_buff = [0b00000000u8; 2];
-        stream.read(&mut result_buff);
+        // let mut result_buff = [0b00000000u8; 2];
+        // stream.read(&mut result_buff);
 
-        if i16::from_be_bytes(result_buff) == -1 {
-            error!(
-                "File({:#?}) failed to copy to server ",
-                file_path.as_os_str()
-            );
-        } else {
-            info!(
-                "File({:#?}) succesfully copied to server",
-                file_path.as_os_str()
-            )
-        }
+        // if i16::from_be_bytes(result_buff) == -1 {
+        //     error!(
+        //         "File({:#?}) failed to copy to server ",
+        //         file_path.as_os_str()
+        //     );
+        // } else {
+        //     info!(
+        //         "File({:#?}) succesfully copied to server",
+        //         file_path.as_os_str()
+        //     )
+        // }
     }
 
     // fn visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry)) -> io::Result<()> {
