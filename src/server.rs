@@ -22,7 +22,8 @@ pub trait ReadFromStream {
     async fn read_data(
         &mut self,
         buf: &mut Vec<u8>,
-        valid_read_index: usize,
+        // Write data into provided buffer from start_index
+        start_index: usize,
     ) -> Result<usize, std::io::Error>;
 }
 
@@ -30,23 +31,23 @@ impl ReadFromStream for TcpStream {
     async fn read_data(
         &mut self,
         buf: &mut Vec<u8>,
-        valid_read_index: usize,
+        start_index: usize,
     ) -> Result<usize, std::io::Error> {
-        // We need to append data after the valid_read_index.
-        self.read(&mut buf[valid_read_index..]).await
+        // We need to append data after the start_index.
+        self.read(&mut buf[start_index..]).await
     }
 }
 
 enum Operation {
     // 01
-    CreateFolder = 0x01,
+    CreateParentFolder = 0x01,
     // 02
     SaveFile = 0x02,
 }
 
 struct BufferState {
-    current_processed_index: usize,
-    valid_read_index: usize,
+    start_index: usize,
+    end_index: usize,
 }
 
 pub struct Server {
@@ -60,18 +61,16 @@ impl Server {
     }
 
     ///
-    /// |---------------------------------------------------|
-    /// |operation|  length   |   data         | checksum   |
-    /// | 1 byte  |  2 bytes |   length bytes  | 32 bit     |
-    /// |---------------------------------------------------|
+    /// |------------------------------------------|
+    /// |  length   |   data          | checksum   |
+    /// |  2 bytes  |   length bytes  | 32 bit     |
+    /// |------------------------------------------|
     ///
-    /// - Read 1st operation Byte: Already Done before this method
-    /// - Read  2 bytes for length of data
+    /// - Read 2 bytes for length of data
     /// - Read length bytes for actual folder_name utf8 bytes.
     /// - Read 32 bit checksum
     /// - compute and compare checksum
-    /// - create File
-    ///
+    /// - create Parent Folder (eg. if path is "/a/b/c.txt", we will create "/a/b")
     ///
     /// ATTENTION:
     /// Given a path like "This/is/a/test/foo/bar"
@@ -81,27 +80,28 @@ impl Server {
     async fn create_parent_folder<T: ReadFromStream>(
         socket: &mut T,
         buf: &mut Vec<u8>,
-        // Usually buf.len() if buf is of type vector. But if buf is of type fixed array, then buf.len() will
-        // give size of array, whereas this will tell the index of last readable byte. Bytes after this will be garbage
-        mut valid_read_index: usize,
+        // Index into buffer, for how many bytes are valid (read from socket)
+        mut end_index: usize,
         // Index into buffer, for how many bytes we have already processed
-        mut current_processed_index: usize,
+        mut start_index: usize,
     ) -> Result<(BufferState, String), Error> {
         debug!(
-            "Recived buf of length {}, with number of valid bytes till {} ",
+            "Recived buf of length {}, with number of valid bytes from start: {} to end: {} ",
             buf.len(),
-            valid_read_index
+            start_index,
+            end_index
         );
+
         let data_length_bytes: usize = 2;
 
-        // Read data_length from buffer which should be next `data_length_bytes`[2] bytes from current_processed_index
+        // Read data_length from buffer which should be next `data_length_bytes` ie 2 bytes from start_index
         // First check, if we have `data_length_bytes` available in data read from stream
-        // If not, loop over stream, until we get >= `data_length_bytes`
+        // If not, loop over stream, until we get >= `data_length_bytes` from stream
         loop {
-            if (valid_read_index - current_processed_index) < data_length_bytes {
+            if (end_index - start_index) < data_length_bytes {
                 // Read more bytes
                 let n = socket
-                    .read_data(buf, valid_read_index)
+                    .read_data(buf, end_index)
                     .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
@@ -111,32 +111,29 @@ impl Server {
                         "No data to read from stream. Cannot create Folder",
                     ));
                 }
-                valid_read_index += n;
+                end_index += n;
             } else {
                 break;
             }
         }
 
-        let folder_name_length = BigEndian::read_u16(
-            &buf[current_processed_index..current_processed_index + data_length_bytes],
-        );
-        // update current_bytes_processed_index to include data_length_bytes
-        current_processed_index += data_length_bytes;
+        let file_path = BigEndian::read_u16(&buf[start_index..start_index + data_length_bytes]);
+        start_index += data_length_bytes;
 
         debug!(
-            "Current bytes processed after reading File name length bytes {} and total bytes read from stream {}",
-            current_processed_index,
-            valid_read_index
+            "Buffer: Start index after reading File path lenght bytes(2) {} and total bytes available to process {}",
+            start_index,
+            end_index-start_index
         );
 
-        debug!("Folder Name has {} bytes", folder_name_length as usize);
+        debug!("File path has length: {} bytes", file_path as usize);
 
-        // Next read the folder_name_length bytes from stream, if not already read.
+        // Next read the actual file_path bytes from stream, if not already read.
         loop {
-            if (valid_read_index - current_processed_index) < folder_name_length as usize {
+            if (end_index - start_index) < file_path as usize {
                 // Read more bytes
                 let n = socket
-                    .read_data(buf, valid_read_index)
+                    .read_data(buf, end_index)
                     .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
@@ -144,79 +141,65 @@ impl Server {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
                         format!(
-                            "Cannot read full Folder name bytes. No of folder name bytes read {}",
-                            valid_read_index - current_processed_index
+                            "Cannot read full file path bytes. No of file path bytes read {}",
+                            end_index - start_index
                         ),
                     ));
                 }
-                valid_read_index += n;
+                end_index += n;
             } else {
                 break;
             }
         }
 
-        let relative_folder_path = match String::from_utf8(
-            buf[current_processed_index..current_processed_index + folder_name_length as usize]
-                .to_vec(),
-        ) {
-            Ok(rp) => rp,
-            Err(e) => {
-                debug!(
-                    "Error while converting foldername bytes to utf8 string. \n Error: {:#?}",
-                    e
-                );
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "Error converting bytes to utf8 for foldername for bytes {:#?}",
-                        buf[current_processed_index
-                            ..current_processed_index + folder_name_length as usize]
-                            .to_vec()
-                    ),
-                ));
-            }
-        };
+        let relative_file_path =
+            match String::from_utf8(buf[start_index..start_index + file_path as usize].to_vec()) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    debug!(
+                        "Error while converting file path bytes to utf8 string. \n Error: {:#?}",
+                        e
+                    );
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "Error converting file path bytes to utf8 {:#?}",
+                            buf[start_index..start_index + file_path as usize].to_vec()
+                        ),
+                    ));
+                }
+            };
 
-        // update processed bytes index to include folder_name length.
-        current_processed_index += folder_name_length as usize;
+        start_index += file_path as usize;
 
         debug!(
-            "Current bytes processed after reading Folder name {} and total bytes read from stream {}",
-            current_processed_index, valid_read_index
+            "Start index {} , End index {} after reading Folder name",
+            start_index, end_index
         );
 
-        let received_checksum: u32 = match read_checksum(
-            &mut valid_read_index,
-            &mut current_processed_index,
-            socket,
-            buf,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+        let received_checksum: u32 =
+            match read_checksum(&mut end_index, &mut start_index, socket, buf).await {
+                Ok(value) => value,
+                Err(e) => return Err(e),
+            };
 
         let mut hasher = Hasher::new();
-        hasher.update(relative_folder_path.as_bytes());
+        hasher.update(relative_file_path.as_bytes());
         let expected_checkeum = hasher.finalize();
 
         // Prefix with download directory
         // if relative File path starts with "/", remove it, or else Path::join will do replace. Read join documentation
         let complete_file_path = Path::new(ROOT_SAVING_DIRECTORY).join(
-            relative_folder_path
+            relative_file_path
                 .strip_prefix("/")
-                .unwrap_or(&relative_folder_path),
+                .unwrap_or(&relative_file_path),
         );
 
-        // If checksum matches, create the File, else log error and move on
+        // If checksum matches, create the Parent folder, else throw error
         if expected_checkeum == received_checksum {
-            debug!(
-                "Complete file path received from stream {:#?} ",
-                complete_file_path
-            );
-            // Just create parent directory, file will be created by caller
-            let directory_prefix = if complete_file_path.ends_with(Path::new("/")) {
+            debug!("Complete file path {:#?} ", complete_file_path);
+            // Just create parent directory, file should be created by caller
+            let parent_folder_path = if complete_file_path.ends_with(Path::new("/")) {
                 complete_file_path.parent().unwrap().parent().unwrap()
             } else {
                 complete_file_path.parent().unwrap()
@@ -224,30 +207,45 @@ impl Server {
 
             debug!(
                 "Creating Parent Folder {}",
-                directory_prefix.to_str().unwrap()
+                parent_folder_path.to_str().unwrap()
             );
 
-            match fs::create_dir_all(directory_prefix) {
-                Ok(_) => debug!("Folder created succesfully {:#?}", directory_prefix),
-                Err(e) => error!(
-                    "Error creating Folder{:#?}.\n## Error ##\n{}",
-                    directory_prefix, e
-                ),
+            match fs::create_dir_all(parent_folder_path) {
+                Ok(_) => debug!("Folder created succesfully {:#?}", parent_folder_path),
+                Err(e) => {
+                    error!(
+                        "Error creating Folder{:#?}.\n## Error ##\n{}",
+                        parent_folder_path, e
+                    );
+
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("Error creating parent folder {e}"),
+                    ));
+                }
             }
         } else {
-            error!("Recieved checksum {} and expected checksum {} did not match. Skipping File creation"
+            error!("Recieved checksum {} and expected checksum {} did not match. Skipping Parent Folder creation"
             , received_checksum, expected_checkeum);
+
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Error creating parent folder, checksum mismatched received: {}, expected {}",
+                    received_checksum, expected_checkeum
+                ),
+            ));
         }
 
         debug!(
-            "Current bytes processed after reading checksum {} and total bytes read from stream {}",
-            current_processed_index, valid_read_index
+            "Start Index {} and End Index {}, after completing parent folder creation",
+            start_index, end_index
         );
 
         Ok((
             BufferState {
-                current_processed_index,
-                valid_read_index,
+                start_index,
+                end_index,
             },
             String::from_utf8(complete_file_path.as_os_str().as_bytes().to_vec()).unwrap(),
         ))
@@ -262,81 +260,77 @@ impl Server {
     async fn save_file<T: ReadFromStream>(
         socket: &mut T,
         buf: &mut Vec<u8>,
-        mut valid_read_index: usize,
+        // Index into buffer, for how many bytes are valid bytes to process
+        mut end_index: usize,
         // Index into buffer, for how many bytes we have already processed
-        mut current_processed_index: usize,
+        mut start_index: usize,
     ) -> Result<(BufferState, String), Error> {
         debug!(
-            "Recived buf of length {}, with number of valid bytes till {} ",
+            "Recived buf of length {}, with number of valid bytes to process {} ",
             buf.len(),
-            valid_read_index
+            end_index - start_index
         );
 
-        // debug!("Buf {:#?}", buf);
-        let mut file_path: Option<String> = Option::None;
-        match Self::create_parent_folder(socket, buf, valid_read_index, current_processed_index)
-            .await
-        {
+        let mut file: Option<File> = Option::None;
+        let mut complete_file_path = Option::None;
+
+        match Self::create_parent_folder(socket, buf, end_index, start_index).await {
             Ok((buffer_state, fp)) => {
-                valid_read_index = buffer_state.valid_read_index;
-                current_processed_index = buffer_state.current_processed_index;
-                file_path = Some(fp);
+                end_index = buffer_state.end_index;
+                start_index = buffer_state.start_index;
+
+                debug!("Creating file at path: {}", fp);
+                file = Some(File::create(fp.clone())?);
+                complete_file_path = Some(fp);
             }
             Err(e) => return Err(Error::new(ErrorKind::InvalidInput, e)),
         }
 
+        let mut file = file.unwrap();
+
         debug!(
-            "Current bytes processed after reading file_name {} and total bytes read from stream {}",
-            current_processed_index, valid_read_index
+            "StartIndex {} and EndIndex {} after reading file_path",
+            start_index, end_index
         );
+
+        // Next read actual file data
         let data_length_bytes: usize = 4;
 
-        // Read data_length from buffer which should be next `data_length_bytes`[2] bytes from current_processed_index
+        // Read data_length from buffer which should be next `data_length_bytes`[4] bytes from start_index
         // First check, if we have `data_length_bytes` available in data read from stream
         // If not, loop over stream, until we get >= `data_length_bytes`
         loop {
-            if (valid_read_index - current_processed_index) < data_length_bytes {
+            if (end_index - start_index) < data_length_bytes {
                 // Read more bytes
                 let n = socket
-                    .read_data(buf, valid_read_index)
+                    .read_data(buf, end_index)
                     .await
                     .expect("failed to read data from socket");
                 if n <= 0 {
                     // We have no data from stream, return error
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        "No data to read from stream. Cannot create File",
+                        "No data to read from stream. Cannot read file data length",
                     ));
                 }
-                valid_read_index += n;
+                end_index += n;
             } else {
                 break;
             }
         }
 
-        let mut file_data_to_read = BigEndian::read_u32(
-            &buf[current_processed_index..current_processed_index + data_length_bytes],
-        );
+        let mut file_data_length =
+            BigEndian::read_u32(&buf[start_index..start_index + data_length_bytes]);
 
-        current_processed_index += data_length_bytes;
+        start_index += data_length_bytes;
 
         debug!(
-            "Current bytes processed after reading file data length bytes {} and total bytes read from stream {}",
-            current_processed_index,
-            valid_read_index
+            "StartIndex {} and EndIndex {} after reading file data length bytes",
+            start_index, end_index
         );
 
-        debug!("File will have {} bytes", file_data_to_read);
+        debug!("File will have {} bytes", file_data_length);
 
-        // create a new file to write data
-        if file_path.is_none() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "File_path is not set. Cannot fill data in file",
-            ));
-        }
-        debug!("Creating file at path: {}", file_path.clone().unwrap());
-        let mut file = File::create(file_path.clone().unwrap())?;
         let mut expected_checksum_hasher = Hasher::new();
 
         // write remaining bytes in buffer to file
@@ -344,56 +338,49 @@ impl Server {
         // Also Init `total_file_data_bytes_read` to log number of file bytes read from stream for debugging
 
         // If file is small and can fit in < 1023 bytes, we need to read till that index
-        let file_data_end_index = min(
-            current_processed_index + file_data_to_read as usize,
-            valid_read_index,
-        );
+        let file_data_end_index = min(start_index + file_data_length as usize, end_index);
 
-        debug!("Reading first buffer data from {current_processed_index} to {file_data_end_index}");
-        let mut total_file_data_bytes_read = file
-            .write(&buf[current_processed_index..file_data_end_index])
-            .unwrap();
+        debug!("Reading first buffer data from {start_index} to {file_data_end_index}");
+        let mut total_file_data_bytes_read =
+            file.write(&buf[start_index..file_data_end_index]).unwrap();
         debug!("Total bytes read from initial buffer {total_file_data_bytes_read}");
 
-        expected_checksum_hasher.update(&buf[current_processed_index..file_data_end_index]);
+        expected_checksum_hasher.update(&buf[start_index..file_data_end_index]);
 
-        file_data_to_read -= total_file_data_bytes_read as u32;
+        file_data_length -= total_file_data_bytes_read as u32;
 
-        current_processed_index = file_data_end_index;
+        start_index = file_data_end_index;
 
         debug!(
-            "CurrentProcessedIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataRemaining {file_data_to_read}"
+            "StartIndex {start_index}, EndIndex {end_index}, FileDataRemaining {file_data_length}"
         );
 
         loop {
-            if (valid_read_index - current_processed_index) < file_data_to_read as usize {
+            if (end_index - start_index) < file_data_length as usize {
                 // IF we have read all data in buffer, reset indexes
-                if current_processed_index == buf.len() {
+                if start_index == buf.len() {
                     // Now we can reset our pointers to use whole buffer for reading data from stream
-                    valid_read_index = 0;
-                    current_processed_index = 0;
+                    end_index = 0;
+                    start_index = 0;
                 }
 
                 // Read file data bytes and write to file
-                let n = socket
-                    .read_data(buf, valid_read_index)
-                    .await
-                    .expect(&format!(
-                        "failed to read data from socket, cpi: {}, vri: {}, fdl: {}",
-                        current_processed_index, valid_read_index, file_data_to_read
-                    ));
+                let n = socket.read_data(buf, end_index).await.expect(&format!(
+                    "failed to read data from socket, cpi: {}, vri: {}, fdl: {}",
+                    start_index, end_index, file_data_length
+                ));
                 if n <= 0 {
                     // We have no data from stream, return error
                     return Err(Error::new(
                         ErrorKind::InvalidData,
                         format!(
                             "Cannot read full File name bytes. No of File name bytes read {}",
-                            valid_read_index - current_processed_index
+                            end_index - start_index
                         ),
                     ));
                 }
 
-                valid_read_index += n;
+                end_index += n;
                 // total_file_data_bytes_read += n;
                 // file_data_to_read -= n as u32;
 
@@ -405,34 +392,34 @@ impl Server {
                 //                                  |file_data_bytes|checksum bits|
                 // current_processed_index is here ->                              <- valid_read_index is here
                 // Then write only file data bytes to file
-                if valid_read_index > current_processed_index + file_data_to_read as usize {
-                    debug!("Writing last file data chunk. CurrentProcessIndex {current_processed_index}, ValidReadIndex {valid_read_index}, FileDataLengthRemainig {file_data_to_read}, TotalBytesRead {total_file_data_bytes_read}");
-                    let current_data_slice = &buf[current_processed_index
-                        ..current_processed_index + file_data_to_read as usize];
+                if end_index > start_index + file_data_length as usize {
+                    debug!("Writing last file data chunk. CurrentProcessIndex {start_index}, ValidReadIndex {end_index}, FileDataLengthRemainig {file_data_length}, TotalBytesRead {total_file_data_bytes_read}");
+                    let current_data_slice =
+                        &buf[start_index..start_index + file_data_length as usize];
 
                     file.write_all(current_data_slice)?;
                     // file.flush().unwrap();
                     expected_checksum_hasher.update(current_data_slice);
 
-                    current_processed_index += file_data_to_read as usize;
+                    start_index += file_data_length as usize;
 
-                    total_file_data_bytes_read += file_data_to_read as usize;
+                    total_file_data_bytes_read += file_data_length as usize;
                     // TODO: Should we use u32 instead of usize
-                    file_data_to_read -= current_processed_index as u32;
+                    file_data_length -= start_index as u32;
                     // File data length should be zero here
-                    assert!(file_data_to_read == 0);
+                    assert!(file_data_length == 0);
                 } else {
-                    let current_data_slice = &buf[current_processed_index..valid_read_index];
+                    let current_data_slice = &buf[start_index..end_index];
 
                     // TODO: It can panic here: read result and return error
                     file.write_all(current_data_slice).unwrap();
                     // file.flush().unwrap(); // TODO do we need to flush everytime ?
                     expected_checksum_hasher.update(current_data_slice);
 
-                    current_processed_index += n;
+                    start_index += n;
 
                     total_file_data_bytes_read += n;
-                    file_data_to_read -= n as u32;
+                    file_data_length -= n as u32;
                 }
 
                 // debug!("cpi {current_processed_index}, vri {valid_read_index}, n {n}, tbr {total_file_data_bytes_read}");
@@ -448,17 +435,11 @@ impl Server {
         }
 
         // Read 32 bits checksum
-        let received_checksum: u32 = match read_checksum(
-            &mut valid_read_index,
-            &mut current_processed_index,
-            socket,
-            buf,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+        let received_checksum: u32 =
+            match read_checksum(&mut end_index, &mut start_index, socket, buf).await {
+                Ok(value) => value,
+                Err(e) => return Err(e),
+            };
 
         let expected_checksum = expected_checksum_hasher.finalize();
         if received_checksum != expected_checksum {
@@ -468,17 +449,17 @@ impl Server {
                     "Computed checksum {} and received checksum {} do not match for file {}",
                     expected_checksum,
                     received_checksum,
-                    file_path.unwrap()
+                    complete_file_path.unwrap()
                 ),
             ));
         }
 
         Ok((
             BufferState {
-                current_processed_index,
-                valid_read_index,
+                start_index,
+                end_index,
             },
-            file_path.unwrap(),
+            complete_file_path.unwrap(),
         ))
     }
 
@@ -505,14 +486,17 @@ impl Server {
                 if n <= 0 {
                     error!("{n} bytes found for request. Closing connection");
                     let result: i16 = -1;
-                    socket.write_all(&result.to_be_bytes());
+                    match socket.write_all(&result.to_be_bytes()).await {
+                        Ok(_) => {}
+                        Err(e) => error!("Error writing response to client {e}"),
+                    }
                     return;
                 }
 
-                // First byte is [`Operation`] byte either 01 or 02
-                if buf[0] & Operation::CreateFolder as u8 == 1 {
+                // First byte is [`Operation`] byte, either 000000001 or 000000010
+                if buf[0] == Operation::CreateParentFolder as u8 {
                     match Self::create_parent_folder(&mut socket, &mut buf, n, 1).await {
-                        Ok(_) => debug!("File created sucesfully"),
+                        Ok(_) => debug!("Folder created sucesfully"),
                         Err(e) => {
                             error!("File failed to create with error\n{e}, read debug logs. Closing connection");
                             let result: i16 = -1;
@@ -528,7 +512,7 @@ impl Server {
                         Err(e) => {
                             error!("File failed to save with error\n{e}, read debug logs. Closing connection");
                             let result: i16 = -1;
-                            socket.write_all(&result.to_be_bytes());
+                            socket.write_all(&result.to_be_bytes()).await;
                             return;
                         }
                     }
@@ -539,7 +523,7 @@ impl Server {
 
                 // 1 is OK, -1 is ERROR
                 let result: u16 = 1;
-                socket.write_all(&result.to_be_bytes());
+                socket.write_all(&result.to_be_bytes()).await;
                 debug!("Request completed");
             });
         }
@@ -551,16 +535,16 @@ impl Server {
 }
 
 async fn read_checksum<T: ReadFromStream>(
-    valid_read_index: &mut usize,
-    current_processed_index: &mut usize,
+    end_index: &mut usize,
+    start_index: &mut usize,
     socket: &mut T,
     buf: &mut Vec<u8>,
 ) -> Result<u32, Error> {
     let checksum_bytes_length = 4;
     loop {
-        if *valid_read_index - *current_processed_index < checksum_bytes_length {
+        if *end_index - *start_index < checksum_bytes_length {
             let n = socket
-                .read_data(buf, *valid_read_index)
+                .read_data(buf, *end_index)
                 .await
                 .expect("failed to read data from socket");
             if n <= 0 {
@@ -569,27 +553,27 @@ async fn read_checksum<T: ReadFromStream>(
                     ErrorKind::InvalidData,
                     format!(
                         "Cannot read checksum from stream. No of checksum bytes read {}",
-                        *valid_read_index - *current_processed_index
+                        *end_index - *start_index
                     ),
                 ));
             }
-            *valid_read_index += n;
+            *end_index += n;
         } else {
             break;
         }
     }
 
     debug!(
-        "Checksum bytes: {:#?} from {current_processed_index}",
-        &buf[*current_processed_index..*current_processed_index + checksum_bytes_length]
+        "Checksum bytes: {:#?} from {start_index}",
+        &buf[*start_index..*start_index + checksum_bytes_length]
     );
     let received_checksum = Hasher::new_with_initial(BigEndian::read_u32(
-        &buf[*current_processed_index..*current_processed_index + checksum_bytes_length],
+        &buf[*start_index..*start_index + checksum_bytes_length],
     ))
     .finalize();
 
     // update current bytes processed to include checksum
-    *current_processed_index += checksum_bytes_length;
+    *start_index += checksum_bytes_length;
 
     Ok(received_checksum)
 }
@@ -597,7 +581,6 @@ async fn read_checksum<T: ReadFromStream>(
 #[cfg(test)]
 mod tests {
 
-    
     use crc32fast::Hasher;
     use std::{fs::File, io::Write, sync::Once};
     use tracing::debug;
@@ -735,10 +718,10 @@ mod tests {
         {
             Ok((buffer_state, folder_name_created)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
-                assert_eq!(buffer_state.current_processed_index, number_of_bytes_read);
+                assert_eq!(buffer_state.start_index, number_of_bytes_read);
                 // Assert bytes read during operation is equal to number of bytes in buffer
                 // This will also assert we never called TcpStreamTestGood::read_data method, as we passed full buffer.
-                assert_eq!(buffer_state.valid_read_index, number_of_bytes_read);
+                assert_eq!(buffer_state.end_index, number_of_bytes_read);
 
                 assert_eq!(
                     get_folder_name(),
@@ -766,10 +749,10 @@ mod tests {
         {
             Ok((buffer_state, folder_name_created)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
-                assert_eq!(buffer_state.current_processed_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
                 // Assert bytes read during operation is equal to number of bytes in buffer
                 // This will also assert we never called TcpStreamTestGood::read_data method, as we passed full buffer.
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(
                     get_folder_name(),
                     folder_name_created[ROOT_SAVING_DIRECTORY.len()..]
@@ -799,10 +782,10 @@ mod tests {
         {
             Ok((buffer_state, folder_name_created)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
-                assert_eq!(buffer_state.current_processed_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
                 // Assert bytes read during operation is equal to number of bytes in buffer
                 // This will also assert we never called TcpStreamTestGood::read_data method, as we passed full buffer.
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(
                     get_folder_name(),
                     folder_name_created[ROOT_SAVING_DIRECTORY.len()..]
@@ -833,10 +816,10 @@ mod tests {
         {
             Ok((buffer_state, folder_name_created)) => {
                 // Assert bytes processed returned is equal to number of bytes in buffer happy case
-                assert_eq!(buffer_state.current_processed_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
                 // Assert bytes read during operation is equal to number of bytes in buffer
                 // This will also assert we never called TcpStreamTestGood::read_data method, as we passed full buffer.
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(
                     get_folder_name(),
                     folder_name_created[ROOT_SAVING_DIRECTORY.len()..]
@@ -898,8 +881,8 @@ mod tests {
         let number_of_bytes_read = buf.len();
         match Server::save_file(&mut test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((buffer_state, file_path)) => {
-                assert_eq!(buffer_state.current_processed_index, buf.len());
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(get_file_name(), file_path[ROOT_SAVING_DIRECTORY.len()..]);
             }
             Err(e) => {
@@ -957,8 +940,8 @@ mod tests {
 
         match Server::save_file(&mut test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((buffer_state, file_path)) => {
-                assert_eq!(buffer_state.current_processed_index, buf.len());
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(get_file_name(), file_path[ROOT_SAVING_DIRECTORY.len()..]);
             }
             Err(e) => {
@@ -1027,8 +1010,8 @@ mod tests {
 
         match Server::save_file(&mut test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((buffer_state, file_path)) => {
-                assert_eq!(buffer_state.current_processed_index, buf.len());
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(get_file_name(), file_path[ROOT_SAVING_DIRECTORY.len()..]);
             }
             Err(e) => {
@@ -1079,8 +1062,8 @@ mod tests {
 
         match Server::save_file(&mut test_stream, &mut buf, number_of_bytes_read, 1).await {
             Ok((buffer_state, file_path)) => {
-                assert_eq!(buffer_state.current_processed_index, buf.len());
-                assert_eq!(buffer_state.valid_read_index, buf.len());
+                assert_eq!(buffer_state.start_index, buf.len());
+                assert_eq!(buffer_state.end_index, buf.len());
                 assert_eq!(get_file_name(), file_path[ROOT_SAVING_DIRECTORY.len()..]);
             }
             Err(e) => {

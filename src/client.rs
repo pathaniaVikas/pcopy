@@ -1,5 +1,5 @@
 use std::{
-    fs::{File},
+    fs::File,
     io::{Read, Write},
     net::TcpStream,
     os::unix::ffi::OsStrExt,
