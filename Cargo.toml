@@ -12,3 +12,9 @@ byteorder = "1"
 bytes = "1"
 walkdir = "2"
 iced = "0.13.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+local-ip-address = "0.6"
+
+[[bench]]
+name = "localtransfer"
+harness = false

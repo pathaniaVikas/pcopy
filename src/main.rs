@@ -1,6 +1,7 @@
 #![feature(core_io_borrowed_buf)]
 
 use client::Client;
+use local_ip_address::local_ip;
 use server::Server;
 use std::{env, error::Error, path::Path};
 use tokio::{io::AsyncReadExt, net::TcpListener};
@@ -49,13 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.send_folder(Path::new(path));
         Ok(())
     } else if run_as.to_lowercase() == "server".to_string() {
-        let ip = "10.0.0.139".to_string();
+        let my_local_ip = local_ip().unwrap();
         let port = 8888;
-        let server = Server::init(ip, port);
-        server.run().await;
+        let server = Server::init(my_local_ip.to_string(), port);
+        server.run().await?;
         Result::Ok(())
     } else {
-        print!("Enter either client or server eg. cargo run client OR cargo run server");
+        print!("Enter either client or server eg. `cargo run client <folder_path> <ip_address>` OR `cargo run server`");
         Result::Ok(())
     }
 }
