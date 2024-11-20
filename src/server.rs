@@ -2,15 +2,12 @@ use std::{
     cmp::min,
     fs::{self, File},
     io::{Error, ErrorKind, Read, Write},
-    mem,
     os::unix::ffi::OsStrExt,
     path::Path,
 };
 
 use byteorder::{BigEndian, ByteOrder};
-use bytes::Buf;
 use crc32fast::Hasher;
-use iced::widget::shader::wgpu::naga::valid;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -600,9 +597,9 @@ async fn read_checksum<T: ReadFromStream>(
 #[cfg(test)]
 mod tests {
 
-    use core::error;
+    
     use crc32fast::Hasher;
-    use std::{fs::File, io::Write, path::Path, sync::Once};
+    use std::{fs::File, io::Write, sync::Once};
     use tracing::debug;
 
     use crate::server::ROOT_SAVING_DIRECTORY;

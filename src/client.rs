@@ -1,16 +1,13 @@
-use core::error;
 use std::{
-    fs::{self, DirEntry, File},
-    hash::Hash,
-    io::{self, Read, Write},
+    fs::{File},
+    io::{Read, Write},
     net::TcpStream,
     os::unix::ffi::OsStrExt,
     path::Path,
-    result,
 };
 
 use crc32fast::Hasher;
-use tracing::{debug, error, field::debug, info};
+use tracing::{debug, error, info};
 use walkdir::WalkDir;
 
 pub struct Client {

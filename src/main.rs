@@ -3,9 +3,7 @@
 use client::Client;
 use local_ip_address::local_ip;
 use server::Server;
-use std::{env, error::Error, path::Path};
-use tokio::{io::AsyncReadExt, net::TcpListener};
-use tracing::{error, info};
+use std::{env, path::Path};
 
 mod client;
 mod server;
