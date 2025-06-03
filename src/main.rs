@@ -1,12 +1,15 @@
-#![feature(core_io_borrowed_buf)]
-
-use client::Client;
-use local_ip_address::local_ip;
-use server::Server;
-use std::{env, path::Path};
+// #![feature(core_io_borrowed_buf)]
 
 mod client;
+use crate::client::client::Client;
+
 mod server;
+use crate::server::server::Server;
+
+mod relay;
+use local_ip_address::local_ip;
+use std::{env, path::Path};
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
