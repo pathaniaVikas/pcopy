@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::{Error, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{mpsc::SendError, Arc},
@@ -7,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use iced::futures::TryFutureExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -110,7 +110,22 @@ pub enum Operation {
     Ping = 0x04,
 }
 
-pub type PEER_ID = Vec<u8>;
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct PeerId(Vec<u8>);
+
+impl Display for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match String::from_utf8(self.0.clone()) {
+            Ok(peer_id_string) => {
+                write!(f, "{}", peer_id_string)?;
+            }
+            Err(_) => {
+                write!(f, "{}", "MalformedPeerId")?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Relay Server is used to help two peers connect to each other.
 /// We are trying to mimic algorithm for TCP hole punching.
@@ -169,27 +184,23 @@ pub trait RelayServer {
     ///           See [ConnectionMetadata]
     fn register(
         &mut self,
-        peer_id: PEER_ID,
+        peer_id: PeerId,
         source_ip: IpAddr,
         socket: Arc<Mutex<TcpStream>>,
     ) -> Result<bool, Error>;
 
     /// Probe: Probe the peer and find its details like its IP, and Time it takes to reach peer from Relay server
     ///        Returns [PeerInfo]
-    ///        This gives the asking peer the idea of total_RTT from source_peer -> RelayServer -> destination_peer.
+    ///        This gives the asking peer, the idea of total_RTT from "source_peer -> RelayServer -> destination_peer"
     ///
-    fn probe(&mut self, target_ip: IpAddr, source_ip: IpAddr) -> Result<PeerInfo, Error>;
+    async fn probe(&mut self, peer_id: PeerId) -> Result<PeerInfo, Error>;
 
     /// Synchronize: Source peer tells destination peer to start the connection for hole punching to succeed.
     ///         As peer receives this request, it opens connection to source peer.
     ///         Source Peer waits for total_rtt//2 and initiates connection to destination peer.
     ///         Once both connects, both sends Ack to Relay server.
     ///         Relay server closes both the connections
-    fn synchronize(
-        &mut self,
-        source_peer_id: PEER_ID,
-        destination_peer_id: PEER_ID,
-    ) -> Result<bool, Error>;
+    async fn synchronize(&mut self, destination_peer_id: PeerId) -> Result<(), Error>;
 
     /// Just sends empty response, to be used to probe connection time between peer and relay server
     fn ping(&mut self) -> Result<bool, Error>;
@@ -207,10 +218,10 @@ struct PeerConnectionMetadata {
 /// Main logic to listen to connections and process them.
 /// Server maintains map of [PEER_ID] -> [PeerConnectionMetadata]
 /// to be used for hole punching. see [RelayServer]
-/// TODO: Currently we don't delete items from the map, which needs to be fixed
+/// TODO: Currently we don't delete items from the map, needs to be fixed
 struct Server {
     server_address: String,
-    conn_map: HashMap<PEER_ID, PeerConnectionMetadata>,
+    conn_map: HashMap<PeerId, PeerConnectionMetadata>,
 }
 
 impl Server {
@@ -220,7 +231,8 @@ impl Server {
     }
 
     /// Given peer id, returns the socket registered for that peer
-    pub fn get_connection(&self, peer_id: &PEER_ID) -> Option<PeerConnectionMetadata> {
+    /// Do not guarantee that socket is alive
+    pub fn get_connection(&self, peer_id: &PeerId) -> Option<PeerConnectionMetadata> {
         match self.conn_map.get(peer_id) {
             Some(conn_md) => Some(conn_md.clone()),
             None => None,
@@ -231,7 +243,7 @@ impl Server {
 impl RelayServer for Server {
     fn register(
         &mut self,
-        peer_id: PEER_ID,
+        peer_id: PeerId,
         source_ip: IpAddr,
         socket: Arc<Mutex<TcpStream>>,
     ) -> Result<bool, Error> {
@@ -241,19 +253,153 @@ impl RelayServer for Server {
         };
 
         self.conn_map.insert(peer_id, conn_md);
+
         Ok(true)
     }
 
-    fn probe(&mut self, target_ip: IpAddr, source_ip: IpAddr) -> Result<u128, Error> {
-        todo!()
+    async fn probe(&mut self, peer_id: PeerId) -> Result<PeerInfo, Error> {
+        let ping = (PeerRequestCodes::Ping as u32).to_be_bytes();
+        if let Some(conn_md) = self.get_connection(&peer_id) {
+            let mut max_tries = 3;
+            let mut time_to_reach_peer = Duration::default();
+
+            while max_tries > 0 {
+                let start = Instant::now();
+
+                match conn_md
+                    .tcp_stream
+                    .try_lock()
+                    .unwrap()
+                    .write_all(&ping)
+                    .await
+                {
+                    Ok(_) => {
+                        // Read one byte client response
+                        let read_until = 1;
+                        let mut n = 0;
+                        let mut buf = vec![0; 1];
+
+                        while n <= read_until {
+                            n = conn_md
+                                .tcp_stream
+                                .try_lock()
+                                .unwrap()
+                                .read(&mut buf)
+                                .await
+                                .expect("failed to read data from socket");
+                        }
+                        // Once we got the response from peer, send the time
+                        // it takes for a tcp ping request to asking client
+                        time_to_reach_peer = start.elapsed();
+                        let peer_info = PeerInfo {
+                            ip: conn_md.ip_addr,
+                            ping_rtt: time_to_reach_peer,
+                        };
+                        return Ok(peer_info);
+                    }
+                    Err(e) => {
+                        error!(
+                            "{}",
+                            format!(
+                                "Cannot relay connection to socket {}. Error {}. \n Retry Left {}",
+                                conn_md.ip_addr, e, max_tries
+                            )
+                        );
+
+                        thread::sleep(Duration::from_secs(1));
+                        max_tries -= 1;
+                    }
+                };
+            }
+        } else {
+            error!(
+                "{}",
+                format!(
+                    "Cannot relay connection to socket. Peer {} not registered yet",
+                    String::from_utf8(peer_id.0).unwrap()
+                )
+            );
+            return Err(Error::new(
+                std::io::ErrorKind::NotFound,
+                "Peer not found in cache",
+            ));
+        }
+
+        return Err(Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("Cannot connect to peer {}", peer_id),
+        ));
     }
 
-    fn synchronize(
-        &mut self,
-        source_peer_id: PEER_ID,
-        destination_peer_id: PEER_ID,
-    ) -> Result<bool, Error> {
-        todo!()
+    async fn synchronize(&mut self, destination_peer_id: PeerId) -> Result<(), Error> {
+        if let Some(conn_md) = self.get_connection(&destination_peer_id) {
+            let init_connect_request = create_synchronize_request(&conn_md);
+
+            match conn_md
+                .tcp_stream
+                .try_lock()
+                .unwrap()
+                .write_all(&init_connect_request)
+                .await
+            {
+                Ok(_) => {
+                    // Read one byte client response, sent when direct conn is established
+                    // between two peers
+                    let read_until = 1;
+                    let mut n = 0;
+                    let mut buf_new = vec![0; 1];
+
+                    while n <= read_until {
+                        n = conn_md
+                            .tcp_stream
+                            .try_lock()
+                            .unwrap()
+                            .read(&mut buf_new)
+                            .await
+                            .expect("failed to read data from socket");
+                    }
+
+                    info!(
+                        "{}",
+                        format!(
+                            "Peer has made connection sucesfully to peer with ip {}",
+                            conn_md.ip_addr.to_string()
+                        )
+                    );
+
+                    // TODO: Shutdown connection
+                    // co.tcp_listener.try_lock().unwrap().shutdown().await;
+                }
+                Err(e) => {
+                    error!(
+                        "{}",
+                        format!(
+                            "Cannot relay synchronize connection request to peer {}. Error {}.",
+                            conn_md.ip_addr.to_string(),
+                            e
+                        )
+                    );
+                    return Err(Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "Cant Send connection init request to peer",
+                    ));
+                }
+            };
+        } else {
+            error!(
+                "{}",
+                format!(
+                    "Cannot send synchronize request to peer. Peer {} not registered yet",
+                    String::from_utf8(destination_peer_id.0).unwrap()
+                )
+            );
+            return Err(Error::new(
+                std::io::ErrorKind::NotFound,
+                "Peer not found in cache",
+            ));
+        }
+
+        Ok(())
     }
 
     fn ping(&mut self) -> Result<bool, Error> {
@@ -261,6 +407,9 @@ impl RelayServer for Server {
     }
 }
 
+/// We need a mutable handle to Server, since it holds a hashmap of <[PEER_ID], <[PeerConnectionMetadata]>.
+/// This provides a mutex over the server, so that multiple connections/tokio tasks can access
+/// the internal hashmap
 #[derive(Clone)]
 struct MutableServerHandle {
     inner: Arc<Mutex<Server>>,
@@ -276,6 +425,7 @@ impl MutableServerHandle {
         }
     }
 
+    /// Exposed method, to call methods on server with lock
     pub fn with_lock<F, T>(&self, func: F) -> T
     where
         F: FnOnce(&mut Server) -> T,
@@ -286,15 +436,33 @@ impl MutableServerHandle {
         result
     }
 
+    /// Mutex version of register peer call
     pub fn register<'a>(
         &self,
-        peer_id: PEER_ID,
+        peer_id: PeerId,
         source_ip: IpAddr,
         socket: Arc<Mutex<TcpStream>>,
     ) -> Result<bool, Error> {
         self.with_lock(|server| server.register(peer_id, source_ip, socket))
     }
 
+    /// Mutex version of probe peer call
+    /// TODO: Do we need lock here ?
+    pub async fn probe<'a>(&self, peer_id: PeerId) -> Result<PeerInfo, Error> {
+        self.inner.try_lock().unwrap().probe(peer_id).await
+    }
+
+    /// Mutex version of probe peer call
+    /// TODO: Do we need lock here ?
+    pub async fn synchronize<'a>(&self, destination_peer_id: PeerId) -> Result<(), Error> {
+        self.inner
+            .try_lock()
+            .unwrap()
+            .synchronize(destination_peer_id)
+            .await
+    }
+
+    /// Main server loop
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let server_address = self.with_lock(|server| server.get_server_address());
 
@@ -303,167 +471,104 @@ impl MutableServerHandle {
         info!("Server started on ip: {}", server_address);
 
         loop {
-            let (mut socket, sock_addr) = listener.accept().await?;
+            let (socket, sock_addr) = listener.accept().await?;
             let cloned_self = self.clone();
             tokio::spawn(async move {
-                process_connection(socket, cloned_self, sock_addr).await;
+                cloned_self.process_connection(socket, sock_addr).await;
             });
         }
     }
-}
 
-async fn process_connection(
-    mut socket: TcpStream,
-    cloned_self: MutableServerHandle,
-    sock_addr: SocketAddr,
-) {
-    let mut buf = vec![0; 1024];
-    let mut n = 0;
-    // First Byte | Operation |
-    let mut read_until = 1;
-    while n <= read_until {
-        // Keep the connection open
-        n = socket
-            .read(&mut buf)
-            .await
-            .expect("failed to read data from socket");
-    }
-
-    if buf[0] == Operation::Register as u8 {
-        // Peer Id is 128 bytes
-        read_until = read_until + 128;
-        read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
-        register_peer(socket, buf, cloned_self, sock_addr).await;
-    } else if buf[0] == Operation::Probe as u8 {
-        // Peer Id is 128 bytes
-        read_until = read_until + 128;
-        read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
-        match relay_conn_time(buf, cloned_self).await {
-            Ok(relay_time) => {
-                let mut response: Vec<u8> = Vec::new();
-                response.extend_from_slice(&(ResponseCodes::ConnectSuccess as u32).to_be_bytes());
-                response.extend_from_slice(&relay_time.as_millis().to_be_bytes());
-
-                socket.write_all(&response).await;
-            }
-            Err(_) => {
-                socket
-                    .write_all(&(ResponseCodes::ConnectFailure as u32).to_be_bytes())
-                    .await;
-            }
-        }
-    } else if buf[0] == Operation::Synchronize as u8 {
-        // Peer Id is 128 bytes
-        read_until = read_until + 128;
-        read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
-
-        // This will shutdown both the connections from two peers
-        match relay_initiate_request(&buf, cloned_self).await {
-            Ok(_) => {
-                // Once we got the response from one peer, check response from peer
-                // which started the connection
-                read_until = read_until + 1;
-                read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
-
-                info!(
-                    "{}",
-                    format!(
-                        "Peer 1 with ip {} has made connection sucesfully to Peer 2",
-                        sock_addr
-                    )
-                );
-            }
-            Err(_) => {
-                error!("Cannot Initiate Connection with peer");
-                socket
-                    .write_all(&(ResponseCodes::InitiateConnectFailure as u32).to_be_bytes())
-                    .await;
-            }
-        }
-
-        // TODO: Shutdown connection
-        // socket.shutdown();
-    }
-}
-
-async fn relay_initiate_request(
-    buf: &Vec<u8>,
-    cloned_self: MutableServerHandle,
-) -> Result<(), Error> {
-    let peer_id: Vec<_> = buf[1..129].iter().cloned().collect();
-    let conn_md = cloned_self.with_lock(|server| server.get_connection(&peer_id));
-
-    match conn_md {
-        Some(ref co) => {
-            let mut init_connect_request = Vec::new();
-            init_connect_request
-                .extend_from_slice(&(PeerRequestCodes::InitConnect as u32).to_be_bytes());
-            let ip_bytes = match co.ip_addr {
-                IpAddr::V4(ip) => ip.octets().to_vec(),
-                IpAddr::V6(ip) => ip.octets().to_vec(),
-            };
-            init_connect_request.extend_from_slice(&ip_bytes);
-
-            match co
-                .tcp_stream
-                .try_lock()
-                .unwrap()
-                .write_all(&init_connect_request)
+    async fn process_connection(self, mut socket: TcpStream, sock_addr: SocketAddr) {
+        let mut buf = vec![0; 1024];
+        let mut n = 0;
+        // First Byte | Operation |
+        let mut read_until = 1;
+        while n <= read_until {
+            // Keep the connection open
+            n = socket
+                .read(&mut buf)
                 .await
-            {
-                Ok(_) => {
-                    // Read one byte client response, sent when direct conn is established
-                    // between two peers
-                    let read_until = 1;
-                    let mut n = 0;
-                    let mut buf_new = vec![0; 1];
+                .expect("failed to read data from socket");
+        }
 
-                    while n <= read_until {
-                        n = co
-                            .tcp_stream
-                            .try_lock()
-                            .unwrap()
-                            .read(&mut buf_new)
-                            .await
-                            .expect("failed to read data from socket");
-                    }
+        if buf[0] == Operation::Register as u8 {
+            // Peer Id is 128 bytes
+            read_until = read_until + 128;
+
+            read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
+
+            let socket_to_copy = Arc::new(Mutex::new(socket));
+            let peer_id: Vec<_> = buf[1..129].iter().cloned().collect();
+
+            match self.register(
+                PeerId(peer_id.clone()),
+                sock_addr.ip(),
+                socket_to_copy.clone(),
+            ) {
+                Ok(_) => {
+                    info!(
+                        "Peer registered with peer id {}",
+                        String::from_utf8(peer_id).unwrap()
+                    );
+                    let response = (ResponseCodes::RegisterSuccess as u32).to_be_bytes();
+                    socket_to_copy
+                        .try_lock()
+                        .unwrap()
+                        .write_all(&response)
+                        .await;
+                }
+                Err(e) => error!("Peer failed to register {}", e),
+            };
+        } else if buf[0] == Operation::Probe as u8 {
+            // Peer Id is 128 bytes
+            read_until = read_until + 128;
+            read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
+            let peer_id = PeerId(buf[1..129].iter().cloned().collect());
+            match self.probe(peer_id).await {
+                Ok(peer_info) => {
+                    socket.write_all(&peer_info.to_be_bytes()).await;
+                }
+                Err(_) => {
+                    socket
+                        .write_all(&(ResponseCodes::ConnectFailure as u32).to_be_bytes())
+                        .await;
+                }
+            }
+        } else if buf[0] == Operation::Synchronize as u8 {
+            // Peer Id is 128 bytes
+            read_until = read_until + 128;
+            read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
+            let peer_id = PeerId(buf[1..129].iter().cloned().collect());
+
+            // This will shutdown both the connections from two peers
+            match self.synchronize(peer_id).await {
+                Ok(_) => {
+                    // Once we got the response from one peer, check response from peer
+                    // which started the connection
+                    read_until = read_until + 1;
+                    read_from_socket(&mut n, read_until, &mut socket, &mut buf).await;
 
                     info!(
                         "{}",
                         format!(
-                            "Peer {} has made connection sucesfully to calling peer with ip {}",
-                            String::from_utf8(peer_id.clone()).unwrap(),
-                            co.ip_addr.to_string()
+                            "Peer 1 with ip {} has made connection sucesfully to Peer 2",
+                            sock_addr
                         )
                     );
-
-                    // TODO: Shutdown connection
-                    // co.tcp_listener.try_lock().unwrap().shutdown().await;
                 }
-                Err(e) => {
-                    error!(
-                        "{}",
-                        format!(
-                        "Cannot relay initiate connection request to client with socket {}. Error {}.",
-                        co.ip_addr, e
-                        )
-                    );
-                    return Err(Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        "Cant Send connection init request to peer",
-                    ));
+                Err(_) => {
+                    error!("Cannot Initiate Connection with peer");
+                    socket
+                        .write_all(&(ResponseCodes::InitiateConnectFailure as u32).to_be_bytes())
+                        .await;
                 }
-            };
-        }
-        None => {
-            return Err(Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "Peer connection not found in hashmap",
-            ));
-        }
-    };
+            }
 
-    Ok(())
+            // TODO: Shutdown connection
+            // socket.shutdown();
+        }
+    }
 }
 
 async fn read_from_socket(
@@ -480,114 +585,13 @@ async fn read_from_socket(
     }
 }
 
-async fn relay_conn_time(
-    buf: Vec<u8>,
-    cloned_self: MutableServerHandle,
-) -> Result<Duration, Error> {
-    let peer_id: Vec<_> = buf[1..129].iter().cloned().collect();
-    let ping = (PeerRequestCodes::Ping as u32).to_be_bytes();
-    let conn_md = cloned_self.with_lock(|server| server.get_connection(&peer_id));
-
-    let mut max_tries = 3;
-    let mut time_to_reach_peer = Duration::default();
-
-    while max_tries > 0 {
-        match conn_md {
-            Some(ref co) => {
-                let read_until_1 = 1;
-                let mut n_1 = 0;
-                let mut buf_1 = vec![0; 1];
-
-                let start = Instant::now();
-                match co.tcp_stream.try_lock().unwrap().write_all(&ping).await {
-                    Ok(_) => {
-                        // REad one byte client response
-
-                        while n_1 <= read_until_1 {
-                            n_1 = co
-                                .tcp_stream
-                                .try_lock()
-                                .unwrap()
-                                .read(&mut buf_1)
-                                .await
-                                .expect("failed to read data from socket");
-                        }
-                        // Once we got the response from peer, send the time
-                        // it takes for a tcp ping request to asking client
-                        time_to_reach_peer = start.elapsed();
-                        break;
-                    }
-                    Err(e) => {
-                        error!(
-                            "{}",
-                            format!(
-                                "Cannot relay connection to socket {}. Error {}. \n Retry Left {}",
-                                co.ip_addr, e, max_tries
-                            )
-                        );
-
-                        thread::sleep(Duration::from_secs(1));
-                        max_tries -= 1;
-                    }
-                };
-            }
-            None => {
-                error!(
-                    "{}",
-                    format!(
-                        "Cannot relay connection to socket. Conn not found in hashmap. \n Retry Left {}",
-                        max_tries
-                    )
-                );
-
-                thread::sleep(Duration::from_secs(1));
-                max_tries -= 1;
-            }
-        };
-    }
-
-    if max_tries <= 0 {
-        // Client connection is not reachable
-        error!(
-            "{}",
-            format!(
-                "Cannot Relay Connection to peer with peer_id: {} after retries.",
-                String::from_utf8(peer_id).unwrap()
-            )
-        );
-        return Err(Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "Error connecting to peer",
-        ));
-    }
-
-    Ok(time_to_reach_peer)
-}
-
-async fn register_peer(
-    socket: TcpStream,
-    buf: Vec<u8>,
-    cloned_self: MutableServerHandle,
-    sock_addr: SocketAddr,
-) {
-    let socket_to_copy = Arc::new(Mutex::new(socket));
-
-    let peer_id: Vec<_> = buf[1..129].iter().cloned().collect();
-
-    // self.inner.lock().unwrap().register(sock_addr.ip(), conn_md);
-    match cloned_self.register(peer_id.clone(), sock_addr.ip(), socket_to_copy.clone()) {
-        Ok(_) => {
-            info!(
-                "Peer registered with peer id {}",
-                String::from_utf8(peer_id).unwrap()
-            );
-            let response = (ResponseCodes::RegisterSuccess as u32).to_be_bytes();
-            socket_to_copy
-                .try_lock()
-                .unwrap()
-                .write_all(&response)
-                .await;
-        }
-        Err(e) => error!("Peer failed to register {}", e),
+fn create_synchronize_request(conn_md: &PeerConnectionMetadata) -> Vec<u8> {
+    let mut init_connect_request = Vec::new();
+    init_connect_request.extend_from_slice(&(PeerRequestCodes::InitConnect as u32).to_be_bytes());
+    let ip_bytes = match conn_md.ip_addr {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
     };
+    init_connect_request.extend_from_slice(&ip_bytes);
+    init_connect_request
 }
