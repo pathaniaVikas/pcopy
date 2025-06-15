@@ -2,7 +2,10 @@ use std::{fmt::Display, io::Cursor, net::IpAddr};
 
 use bytes::Buf;
 
-use crate::relay::relay::{PeerId, PeerInfo, PEER_ID_LENGTH_BYTES};
+use crate::relay::{
+    peer::{PeerId, PeerInfo, PEER_ID_LENGTH_BYTES},
+    relay::HealthStatus,
+};
 
 // Error for Frame operation
 #[derive(Debug)]
@@ -117,22 +120,40 @@ impl TryFrom<u8> for SendingOperations {
 }
 
 #[derive(Clone)]
-pub enum HealthStatus {
-    HEALTHY = 0x01,
-    UNHEALTHY = 0x02,
+pub enum StatusCodes {
+    SUCCESS = 0x200,
+    FAILURE = 0x500,
 }
 
-impl TryFrom<u8> for HealthStatus {
-    type Error = Error;
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0x01 => Ok(HealthStatus::HEALTHY),
-            0x02 => Ok(HealthStatus::UNHEALTHY),
-            _ => Err(Error::Other(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Sending Operation not supported",
-            ))),
+impl StatusCodes {
+    pub fn into_u8(self) -> u8 {
+        match self {
+            StatusCodes::SUCCESS => StatusCodes::SUCCESS as u8,
+            StatusCodes::FAILURE => StatusCodes::FAILURE as u8,
         }
+    }
+}
+
+const SYNC_CODE: u8 = 100;
+const DOCONNECT_CODE: u8 = 101;
+
+#[derive(Clone)]
+pub enum PeerCommands {
+    SYNC,
+    DOCONNECT(IpAddr),
+}
+
+impl PeerCommands {
+    pub fn to_be_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(PEER_ID_LENGTH_BYTES);
+        match self {
+            PeerCommands::SYNC => bytes.push(SYNC_CODE),
+            PeerCommands::DOCONNECT(source_ip) => {
+                bytes.push(DOCONNECT_CODE);
+                bytes.extend_from_slice(source_ip.as_octets());
+            }
+        }
+        return bytes;
     }
 }
 
@@ -274,45 +295,6 @@ impl Frame<SendingOperations, SendingFrames, Error> for SendingFrames {
             }
             SendingFrames::PingResult(health_status) => vec![health_status as u8],
         }
-    }
-}
-
-const SYNC_CODE: u8 = 0x91;
-const DOCONNECT_CODE: u8 = 0x92;
-
-#[derive(Clone)]
-pub enum StatusCodes {
-    SUCCESS = 0x100,
-    FAILURE = 0x101,
-}
-
-impl StatusCodes {
-    pub fn into_u8(self) -> u8 {
-        match self {
-            StatusCodes::SUCCESS => StatusCodes::SUCCESS as u8,
-            StatusCodes::FAILURE => StatusCodes::FAILURE as u8,
-        }
-    }
-}
-
-// FIX ME
-#[derive(Clone)]
-pub enum PeerCommands {
-    SYNC,
-    DOCONNECT(IpAddr),
-}
-
-impl PeerCommands {
-    pub fn to_be_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(PEER_ID_LENGTH_BYTES);
-        match self {
-            PeerCommands::SYNC => bytes.push(SYNC_CODE),
-            PeerCommands::DOCONNECT(source_ip) => {
-                bytes.push(DOCONNECT_CODE);
-                bytes.extend_from_slice(source_ip.as_octets());
-            }
-        }
-        return bytes;
     }
 }
 

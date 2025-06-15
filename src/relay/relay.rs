@@ -1,12 +1,10 @@
 use std::{
-    fmt::Display,
     io::Error,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Duration,
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use tokio::{
     io::{self, BufWriter},
     net::{TcpListener, TcpStream},
@@ -18,101 +16,11 @@ use tracing::{error, info};
 use crate::relay::{
     cache::Cache,
     connection::{Connection, PeerConnection},
-    frame::{HealthStatus, PeerCommands, RecevingFrames, StatusCodes},
+    frame::{PeerCommands, RecevingFrames, StatusCodes},
+    peer::{PeerConnectionMetadata, PeerId, PeerInfo},
 };
 
-pub const PEER_ID_LENGTH_BYTES: usize = 64;
 pub const PROBE_ACK_LENGTH: usize = 1;
-
-///
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub struct PeerId([u8; PEER_ID_LENGTH_BYTES]);
-
-impl PeerId {
-    pub fn new(buf: &[u8], start_index: usize) -> Self {
-        PeerId(
-            buf[start_index..start_index + PEER_ID_LENGTH_BYTES]
-                .iter()
-                .cloned()
-                .collect::<Vec<u8>>()
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
-impl Display for PeerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", String::from_utf8_lossy(&self.0))?;
-        Ok(())
-    }
-}
-
-/// Will advance the cursor position if value is read
-impl TryFrom<&mut std::io::Cursor<&[u8]>> for PeerId {
-    type Error = std::io::Error;
-
-    fn try_from(value: &mut std::io::Cursor<&[u8]>) -> Result<Self, Self::Error> {
-        let remaining_bytes_to_read = value.get_ref().len() - value.position() as usize;
-
-        if remaining_bytes_to_read < PEER_ID_LENGTH_BYTES {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Cannot read PeerId, found less bytes than required: {PEER_ID_LENGTH_BYTES}"
-                ),
-            ));
-        }
-
-        let start = value.position() as usize;
-        let peer_id = PeerId::new(value.get_ref(), start);
-        value.advance(peer_id.len());
-        Ok(peer_id)
-    }
-}
-
-/// Represents peer metadata
-/// Ip: Peer public IP
-/// ping_rtt: Round trip time it takes to reach to peer from Relay server
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    peer_id: PeerId,
-    ip: IpAddr,
-    ping_rtt: Duration,
-}
-
-impl PeerInfo {
-    /// Convert struct to payload
-    /// | ip Addr | ping time |
-    /// | 4 bytes | 16 bytes  |
-    ///
-    /// Total - 20 bytes palyload
-    pub fn to_be_bytes(&self) -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::with_capacity(20);
-
-        let mut ip_bytes = match self.ip {
-            IpAddr::V4(ip) => ip.octets().to_vec(),
-            IpAddr::V6(ip) => ip.octets().to_vec(),
-        };
-        bytes.append(&mut ip_bytes);
-        bytes.append(&mut self.ping_rtt.as_millis().to_be_bytes().to_vec());
-
-        bytes
-    }
-}
-
-/// Details about peer connection.
-/// tcp_stream: TCP socket (may be closed after two peers are connected)
-/// ip_addr: Public Ip Address of peer, where it can be reached.
-#[derive(Clone)]
-struct PeerConnectionMetadata {
-    stream: Arc<Mutex<BufWriter<TcpStream>>>,
-    ip_addr: IpAddr,
-}
 
 /// Relay Server is used to help two peers connect to each other.
 /// We are trying to mimic algorithm for TCP hole punching.
@@ -193,6 +101,28 @@ pub trait RelayServer {
 
     /// Just sends empty response, to be used to probe connection time between peer and relay server
     fn ping(&mut self) -> Result<bool, Error>;
+}
+
+// Health Status of server
+// TODO
+#[derive(Clone)]
+pub enum HealthStatus {
+    HEALTHY = 0x01,
+    UNHEALTHY = 0x02,
+}
+
+impl TryFrom<u8> for HealthStatus {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(HealthStatus::HEALTHY),
+            0x02 => Ok(HealthStatus::UNHEALTHY),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Sending Operation not supported",
+            )),
+        }
+    }
 }
 
 /// Main logic to listen to connections and process them.
