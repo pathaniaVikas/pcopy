@@ -1,37 +1,57 @@
 use std::{io::Cursor, sync::Arc};
 
-use bytes::BytesMut;
-use iced::futures::io;
+use bytes::{BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::TcpStream,
     sync::Mutex,
 };
 
-use crate::relay::frame::{self, Error, RecevingFrames, SendingFrames};
+use crate::relay::frame::{self, Error, Frame, RecevingFrames, SendingFrames};
+
+// Steram, Buffer, ReceivingFrame, SendingFrame, Error
+pub trait Connection<S, B, RF, SF, E>
+where
+    S: Sync + Send + Clone,
+    B: BufMut,
+{
+    fn new(socket: S) -> Self;
+    async fn read_frame(&mut self) -> Result<Option<RF>, E>;
+    async fn write_frame(&mut self, sf: SF) -> Result<(), E>;
+}
 
 #[derive(Debug)]
-pub struct Connection {
+pub struct PeerConnection {
     pub stream: Arc<Mutex<BufWriter<TcpStream>>>,
     buffer: BytesMut,
 }
 
-impl Connection {
-    pub fn new(socket: Arc<Mutex<BufWriter<TcpStream>>>) -> Self {
-        Connection {
+impl
+    Connection<
+        Arc<Mutex<BufWriter<TcpStream>>>,
+        BytesMut,
+        RecevingFrames,
+        SendingFrames,
+        std::io::Error,
+    > for PeerConnection
+{
+    fn new(socket: Arc<Mutex<BufWriter<TcpStream>>>) -> Self {
+        PeerConnection {
             stream: socket,
             buffer: BytesMut::with_capacity(1024),
         }
     }
 
-    pub async fn read_frame(&mut self) -> Result<Option<RecevingFrames>, std::io::Error> {
+    async fn read_frame(&mut self) -> Result<Option<RecevingFrames>, std::io::Error> {
         Self::read_frame_from_stream(self.stream.clone(), &mut self.buffer).await
     }
 
-    pub async fn write_frame(&mut self, frame: SendingFrames) -> Result<(), std::io::Error> {
-        Self::write_frame_to_stream(self.stream.clone(), frame).await
+    async fn write_frame(&mut self, sf: SendingFrames) -> Result<(), std::io::Error> {
+        Self::write_frame_to_stream(self.stream.clone(), sf).await
     }
+}
 
+impl PeerConnection {
     pub async fn read_frame_from_stream(
         stream: Arc<Mutex<BufWriter<TcpStream>>>,
         mut buffer: &mut BytesMut,
@@ -64,17 +84,6 @@ impl Connection {
         }
     }
 
-    pub async fn write_frame_to_stream(
-        stream: Arc<Mutex<BufWriter<TcpStream>>>,
-        frame: SendingFrames,
-    ) -> Result<(), std::io::Error> {
-        let mut lock = stream.lock().await;
-        lock.write_all(&frame.to_be_bytes()).await?;
-        lock.flush().await;
-        drop(lock);
-        Ok(())
-    }
-
     fn parse_frame(buffer: &BytesMut) -> Result<Option<RecevingFrames>, std::io::Error> {
         let mut buf = Cursor::new(&buffer[..]);
         match RecevingFrames::read_operation(&mut buf) {
@@ -86,5 +95,16 @@ impl Connection {
             Err(Error::Incomplete) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub async fn write_frame_to_stream(
+        stream: Arc<Mutex<BufWriter<TcpStream>>>,
+        frame: SendingFrames,
+    ) -> Result<(), std::io::Error> {
+        let mut lock = stream.lock().await;
+        lock.write_all(&frame.to_be_bytes()).await?;
+        lock.flush().await?;
+        drop(lock);
+        Ok(())
     }
 }

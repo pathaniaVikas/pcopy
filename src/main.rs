@@ -1,7 +1,7 @@
 // #![feature(core_io_borrowed_buf)]
 #![feature(ip_as_octets)]
 mod client;
-use crate::client::client::Client;
+use crate::{client::client::Client, relay::relay::ShareableServerHandle};
 
 mod server;
 use crate::server::server::Server;
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.len() < 2 {
         print!(
-            "Provide argument `server` or `client` eg.\n`cargo run server`\nor\n`cargo run client`"
+            "Provide argument `server/client/relay` eg.\n`cargo run server`\nor\n`cargo run client`"
         );
         return Result::Ok(());
     }
@@ -51,12 +51,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else if run_as.to_lowercase() == "server".to_string() {
         let my_local_ip = local_ip().unwrap();
-        let port = 8888;
+        let port = 9999;
         let server = Server::init(my_local_ip.to_string(), port);
         server.run().await?;
         Result::Ok(())
+    } else if run_as.to_lowercase() == "relay".to_string() {
+        let my_local_ip = local_ip().unwrap();
+        let port = 6666;
+        let server = ShareableServerHandle::init(my_local_ip, port);
+        server.run().await?;
+        Result::Ok(())
     } else {
-        print!("Enter either client or server eg. `cargo run client <folder_path> <ip_address>` OR `cargo run server`");
+        print!("Enter either client/server/relay eg. `cargo run client <folder_path> <ip_address>` OR `cargo run server`");
         Result::Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use std::{
     cmp::min,
     fs::{self, File},
-    io::{Error, ErrorKind, Read, Write},
+    io::{Error, ErrorKind, Write},
     os::unix::ffi::OsStrExt,
     path::Path,
 };

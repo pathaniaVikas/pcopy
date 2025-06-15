@@ -1,26 +1,24 @@
 use std::{
-    collections::HashMap,
     fmt::Display,
-    io::{Cursor, Error, Read, Seek},
+    io::Error,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    thread,
     time::Duration,
 };
 
 use bytes::{Buf, BytesMut};
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt, BufWriter},
+    io::{self, BufWriter},
     net::{TcpListener, TcpStream},
     sync::Mutex,
     time::Instant,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::relay::{
     cache::Cache,
-    connection::Connection,
-    frame::{PeerCommands, RecevingFrames, StatusCodes},
+    connection::{Connection, PeerConnection},
+    frame::{HealthStatus, PeerCommands, RecevingFrames, StatusCodes},
 };
 
 pub const PEER_ID_LENGTH_BYTES: usize = 64;
@@ -185,16 +183,13 @@ pub trait RelayServer {
     ///
     async fn probe(&self, peer_id: PeerId) -> Result<PeerInfo, Error>;
 
-    /// Synchronize: Source peer tells destination peer to start the connection for hole punching to succeed.
-    ///         As peer receives this request, it opens connection to source peer.
-    ///         Source Peer waits for total_rtt//2 and initiates connection to destination peer.
-    ///         Once both connects, both sends Ack to Relay server.
-    ///         Relay server closes both the connections
-    async fn synchronize(
-        &self,
-        destination_peer_id: PeerId,
-        source_ip: IpAddr,
-    ) -> Result<(), Error>;
+    /// DoConnect: Source peer tells destination peer to start the connection for hole punching to succeed.
+    ///             As peer receives this request, it opens connection to source peer.
+    ///             Source Peer waits for total_rtt//2 and initiates connection to destination peer.
+    ///             Once both connects, both sends Ack to Relay server.
+    ///             PeerA (source peer) connection is closed after this.
+    ///
+    async fn doconnect(&self, destination_peer_id: PeerId, source_ip: IpAddr) -> Result<(), Error>;
 
     /// Just sends empty response, to be used to probe connection time between peer and relay server
     fn ping(&mut self) -> Result<bool, Error>;
@@ -209,6 +204,7 @@ pub trait RelayServer {
 struct Server {
     pub server_address: String,
     pub conn_cache: Arc<Cache<PeerId, PeerConnectionMetadata>>,
+    pub health_status: HealthStatus,
 }
 
 impl Server {
@@ -216,6 +212,7 @@ impl Server {
         Server {
             server_address: format!("{}:{port}", ip.to_string()),
             conn_cache: Arc::new(Cache::new(1024)),
+            health_status: HealthStatus::HEALTHY,
         }
     }
 
@@ -241,19 +238,19 @@ impl RelayServer for Server {
     }
 
     ///
-    /// 1. Send ping request to peer
-    /// 2. Wait for its response
-    /// 3. If error connecti
+    /// 1. Send sync request to peer
+    /// 2. Wait for its ACK response
+    /// 3. Return PeerInfo (rtt to PeerB)
     async fn probe(&self, peer_id: PeerId) -> Result<PeerInfo, Error> {
         if let Some(conn_md) = self.conn_cache.get(&peer_id) {
             let start = Instant::now();
-            Connection::write_frame_to_stream(
+            PeerConnection::write_frame_to_stream(
                 conn_md.stream.clone(),
                 super::frame::SendingFrames::Command(PeerCommands::SYNC),
             )
             .await?;
             let mut buffer = BytesMut::with_capacity(PROBE_ACK_LENGTH);
-            match Connection::read_frame_from_stream(conn_md.stream.clone(), &mut buffer)
+            match PeerConnection::read_frame_from_stream(conn_md.stream.clone(), &mut buffer)
                 .await
                 .unwrap()
             {
@@ -296,13 +293,9 @@ impl RelayServer for Server {
         }
     }
 
-    async fn synchronize(
-        &self,
-        destination_peer_id: PeerId,
-        source_ip: IpAddr,
-    ) -> Result<(), Error> {
+    async fn doconnect(&self, destination_peer_id: PeerId, source_ip: IpAddr) -> Result<(), Error> {
         if let Some(conn_md) = self.conn_cache.get(&destination_peer_id) {
-            Connection::write_frame_to_stream(
+            PeerConnection::write_frame_to_stream(
                 conn_md.stream.clone(),
                 super::frame::SendingFrames::Command(PeerCommands::DOCONNECT(source_ip)),
             )
@@ -323,12 +316,12 @@ impl RelayServer for Server {
 }
 
 #[derive(Clone)]
-struct ShareableServerHandle {
+pub struct ShareableServerHandle {
     inner: Arc<Server>,
 }
 
 impl ShareableServerHandle {
-    pub fn new(ip: IpAddr, port: u32) -> Self {
+    pub fn init(ip: IpAddr, port: u32) -> Self {
         ShareableServerHandle {
             inner: Arc::new(Server::new(ip, port)),
         }
@@ -346,7 +339,7 @@ impl ShareableServerHandle {
         loop {
             let (socket, peer_addr) = listener.accept().await?;
             // let cloned_self = self.clone();
-            let connection = Connection::new(Arc::new(Mutex::new(BufWriter::new(socket))));
+            let connection = PeerConnection::new(Arc::new(Mutex::new(BufWriter::new(socket))));
             let server = self.inner.clone();
             tokio::spawn(async move {
                 let _ = process_connection(server, connection, peer_addr).await;
@@ -361,89 +354,133 @@ impl ShareableServerHandle {
 ///                         |client B => register()
 /// client A => Probes      |
 /// write_resp2 to client B | Write resp1 to client B
+/// There is very less chances of this happening until client misbehaves.
 ///
 async fn process_connection(
     server: Arc<Server>,
-    mut connection: Connection,
+    mut connection: PeerConnection,
     peer_address: SocketAddr,
 ) -> io::Result<()> {
     loop {
         match connection.read_frame().await.unwrap() {
             Some(frame) => match frame {
                 RecevingFrames::Register(peer_id) => {
-                    // let lock = connection.stream.get_ref().
-                    match server
-                        .register(
-                            peer_id.clone(),
-                            peer_address.ip(),
-                            connection.stream.clone(),
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            connection
-                                .write_frame(super::frame::SendingFrames::Registered(
-                                    StatusCodes::SUCCESS,
-                                ))
-                                .await?;
-                        }
-                        Err(_) => {
-                            connection
-                                .write_frame(super::frame::SendingFrames::Registered(
-                                    StatusCodes::FAILURE,
-                                ))
-                                .await?;
-                        }
-                    }
+                    process_register_frame(&server, &mut connection, peer_address, peer_id).await?;
                 }
-                RecevingFrames::Probe(peer_id) => match server.probe(peer_id).await {
-                    Ok(peer_info) => {
-                        connection
-                            .write_frame(super::frame::SendingFrames::ProbeResult((
-                                StatusCodes::SUCCESS,
-                                Some(peer_info),
-                            )))
-                            .await?;
-                    }
-                    Err(_) => {
-                        connection
-                            .write_frame(super::frame::SendingFrames::ProbeResult((
-                                StatusCodes::FAILURE,
-                                None,
-                            )))
-                            .await?;
-                    }
-                },
-                RecevingFrames::Synchronize(peer_id) => {
-                    match server.synchronize(peer_id, peer_address.ip()).await {
-                        Ok(()) => {
-                            connection
-                                .write_frame(super::frame::SendingFrames::SynchronizeResult(
-                                    StatusCodes::SUCCESS,
-                                ))
-                                .await?;
-                        }
-                        Err(_) => {
-                            connection
-                                .write_frame(super::frame::SendingFrames::SynchronizeResult(
-                                    StatusCodes::FAILURE,
-                                ))
-                                .await?;
-                        }
-                    }
+                RecevingFrames::Probe(peer_id) => {
+                    process_probe_frame(&server, &mut connection, peer_id).await?
+                }
+                RecevingFrames::DoConnect(peer_id) => {
+                    process_sync_frame(&server, &mut connection, peer_address, peer_id).await?;
                 }
                 RecevingFrames::Ping => {
-                    connection
-                        .write_frame(super::frame::SendingFrames::PingResult)
-                        .await?;
+                    process_ping_frame(&server, &mut connection).await?;
                 }
                 RecevingFrames::ProbeAck => {
                     // Proble Ack is supposed to be read by Probe method, not here.
                     // This indicates some invalid state
                     error!("Unexpected ProbeAck found");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Unexpected ProbeAck frame found",
+                    ));
                 }
             },
             None => return Ok(()),
         }
     }
+}
+
+async fn process_ping_frame(
+    server: &Arc<Server>,
+    connection: &mut PeerConnection,
+) -> Result<(), Error> {
+    connection
+        .write_frame(super::frame::SendingFrames::PingResult(
+            server.health_status.clone(),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn process_sync_frame(
+    server: &Arc<Server>,
+    connection: &mut PeerConnection,
+    peer_address: SocketAddr,
+    peer_id: PeerId,
+) -> Result<(), Error> {
+    Ok(match server.doconnect(peer_id, peer_address.ip()).await {
+        Ok(()) => {
+            connection
+                .write_frame(super::frame::SendingFrames::DoConnectResult(
+                    StatusCodes::SUCCESS,
+                ))
+                .await?;
+        }
+        Err(_) => {
+            connection
+                .write_frame(super::frame::SendingFrames::DoConnectResult(
+                    StatusCodes::FAILURE,
+                ))
+                .await?;
+        }
+    })
+}
+
+async fn process_probe_frame(
+    server: &Arc<Server>,
+    connection: &mut PeerConnection,
+    peer_id: PeerId,
+) -> Result<(), Error> {
+    Ok(match server.probe(peer_id).await {
+        Ok(peer_info) => {
+            connection
+                .write_frame(super::frame::SendingFrames::ProbeResult((
+                    StatusCodes::SUCCESS,
+                    Some(peer_info),
+                )))
+                .await?;
+        }
+        Err(_) => {
+            connection
+                .write_frame(super::frame::SendingFrames::ProbeResult((
+                    StatusCodes::FAILURE,
+                    None,
+                )))
+                .await?;
+        }
+    })
+}
+
+async fn process_register_frame(
+    server: &Arc<Server>,
+    connection: &mut PeerConnection,
+    peer_address: SocketAddr,
+    peer_id: PeerId,
+) -> Result<(), Error> {
+    Ok(
+        match server
+            .register(
+                peer_id.clone(),
+                peer_address.ip(),
+                connection.stream.clone(),
+            )
+            .await
+        {
+            Ok(_) => {
+                connection
+                    .write_frame(super::frame::SendingFrames::RegisterResult(
+                        StatusCodes::SUCCESS,
+                    ))
+                    .await?;
+            }
+            Err(_) => {
+                connection
+                    .write_frame(super::frame::SendingFrames::RegisterResult(
+                        StatusCodes::FAILURE,
+                    ))
+                    .await?;
+            }
+        },
+    )
 }
