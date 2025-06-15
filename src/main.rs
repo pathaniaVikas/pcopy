@@ -1,5 +1,5 @@
 // #![feature(core_io_borrowed_buf)]
-
+#![feature(ip_as_octets)]
 mod client;
 use crate::client::client::Client;
 
@@ -9,7 +9,6 @@ use crate::server::server::Server;
 mod relay;
 use local_ip_address::local_ip;
 use std::{env, path::Path};
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
