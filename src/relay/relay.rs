@@ -105,7 +105,7 @@ pub trait RelayServer {
 
 // Health Status of server
 // TODO
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum HealthStatus {
     HEALTHY = 0x01,
     UNHEALTHY = 0x02,
@@ -269,7 +269,8 @@ impl ShareableServerHandle {
         loop {
             let (socket, peer_addr) = listener.accept().await?;
             // let cloned_self = self.clone();
-            let connection = PeerConnection::new(Arc::new(Mutex::new(BufWriter::new(socket))));
+            let connection =
+                PeerConnection::<TcpStream>::new(Arc::new(Mutex::new(BufWriter::new(socket))));
             let server = self.inner.clone();
             tokio::spawn(async move {
                 let _ = process_connection(server, connection, peer_addr).await;
@@ -288,7 +289,7 @@ impl ShareableServerHandle {
 ///
 async fn process_connection(
     server: Arc<Server>,
-    mut connection: PeerConnection,
+    mut connection: PeerConnection<TcpStream>,
     peer_address: SocketAddr,
 ) -> io::Result<()> {
     loop {
@@ -323,7 +324,7 @@ async fn process_connection(
 
 async fn process_ping_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection,
+    connection: &mut PeerConnection<TcpStream>,
 ) -> Result<(), Error> {
     connection
         .write_frame(super::frame::SendingFrames::PingResult(
@@ -335,7 +336,7 @@ async fn process_ping_frame(
 
 async fn process_sync_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection,
+    connection: &mut PeerConnection<TcpStream>,
     peer_address: SocketAddr,
     peer_id: PeerId,
 ) -> Result<(), Error> {
@@ -359,24 +360,18 @@ async fn process_sync_frame(
 
 async fn process_probe_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection,
+    connection: &mut PeerConnection<TcpStream>,
     peer_id: PeerId,
 ) -> Result<(), Error> {
     Ok(match server.probe(peer_id).await {
         Ok(peer_info) => {
             connection
-                .write_frame(super::frame::SendingFrames::ProbeResult((
-                    StatusCodes::SUCCESS,
-                    Some(peer_info),
-                )))
+                .write_frame(super::frame::SendingFrames::ProbeResult(Some(peer_info)))
                 .await?;
         }
         Err(_) => {
             connection
-                .write_frame(super::frame::SendingFrames::ProbeResult((
-                    StatusCodes::FAILURE,
-                    None,
-                )))
+                .write_frame(super::frame::SendingFrames::ProbeResult(None))
                 .await?;
         }
     })
@@ -384,7 +379,7 @@ async fn process_probe_frame(
 
 async fn process_register_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection,
+    connection: &mut PeerConnection<TcpStream>,
     peer_address: SocketAddr,
     peer_id: PeerId,
 ) -> Result<(), Error> {

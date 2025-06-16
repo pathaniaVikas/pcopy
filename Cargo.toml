@@ -15,6 +15,7 @@ iced = "0.13.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 local-ip-address = "0.6"
 dashmap = "6.0.0"
+rand = "0.9.1"
 
 [[bench]]
 name = "localtransfer"

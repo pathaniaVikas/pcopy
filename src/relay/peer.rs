@@ -1,7 +1,10 @@
 use std::{fmt::Display, io::Error, net::IpAddr, sync::Arc, time::Duration};
 
 use bytes::Buf;
+use rand::RngCore;
 use tokio::{io::BufWriter, net::TcpStream, sync::Mutex};
+
+use crate::relay::{frame, relay};
 
 pub const PEER_ID_LENGTH_BYTES: usize = 64;
 
@@ -24,6 +27,22 @@ impl PeerId {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Default for PeerId {
+    fn default() -> Self {
+        let mut random_bytes: [u8; 64] = [0; 64];
+        let mut rng = rand::rng();
+        // Fill the array with random bytes
+        rng.fill_bytes(&mut random_bytes);
+        PeerId(random_bytes)
+    }
 }
 
 impl Display for PeerId {
@@ -35,18 +54,13 @@ impl Display for PeerId {
 
 /// Will advance the cursor position if value is read
 impl TryFrom<&mut std::io::Cursor<&[u8]>> for PeerId {
-    type Error = std::io::Error;
+    type Error = frame::Error;
 
     fn try_from(value: &mut std::io::Cursor<&[u8]>) -> Result<Self, Self::Error> {
         let remaining_bytes_to_read = value.get_ref().len() - value.position() as usize;
 
         if remaining_bytes_to_read < PEER_ID_LENGTH_BYTES {
-            return Err(Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Cannot read PeerId, found less bytes than required: {PEER_ID_LENGTH_BYTES}"
-                ),
-            ));
+            return Err(frame::Error::Incomplete);
         }
 
         let start = value.position() as usize;
@@ -59,13 +73,22 @@ impl TryFrom<&mut std::io::Cursor<&[u8]>> for PeerId {
 /// Represents peer metadata
 /// Ip: Peer public IP
 /// ping_rtt: Round trip time it takes to reach to peer from Relay server
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PeerInfo {
     pub peer_id: PeerId,
     pub ip: IpAddr,
     pub ping_rtt: Duration,
 }
 
+impl Default for PeerInfo {
+    fn default() -> Self {
+        PeerInfo {
+            peer_id: PeerId([0; PEER_ID_LENGTH_BYTES]),
+            ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            ping_rtt: Duration::from_millis(0),
+        }
+    }
+}
 impl PeerInfo {
     /// Convert struct to payload
     /// | ip Addr | ping time |
