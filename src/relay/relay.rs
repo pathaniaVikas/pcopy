@@ -15,8 +15,8 @@ use tracing::{error, info};
 
 use crate::relay::{
     cache::Cache,
-    connection::{Connection, PeerConnection},
-    frame::{PeerCommands, RecevingFrames, StatusCodes},
+    connection::{Connection, RelayConnection},
+    frame::{self, Frame, Operations, PeerCommands, RelayFrames, StatusCodes},
     peer::{PeerConnectionMetadata, PeerId, PeerInfo},
 };
 
@@ -174,18 +174,18 @@ impl RelayServer for Server {
     async fn probe(&self, peer_id: PeerId) -> Result<PeerInfo, Error> {
         if let Some(conn_md) = self.conn_cache.get(&peer_id) {
             let start = Instant::now();
-            PeerConnection::write_frame_to_stream(
+            RelayConnection::write_frame_to_stream(
                 conn_md.stream.clone(),
-                super::frame::SendingFrames::Command(PeerCommands::SYNC),
+                super::frame::PeerFrames::Command(PeerCommands::SYNC),
             )
             .await?;
             let mut buffer = BytesMut::with_capacity(PROBE_ACK_LENGTH);
-            match PeerConnection::read_frame_from_stream(conn_md.stream.clone(), &mut buffer)
+            match RelayConnection::read_frame_from_stream(conn_md.stream.clone(), &mut buffer)
                 .await
                 .unwrap()
             {
                 Some(frame) => match frame {
-                    RecevingFrames::ProbeAck => {
+                    RelayFrames::ProbeAck => {
                         let time_to_reach_peer = start.elapsed();
                         let peer_info = PeerInfo {
                             peer_id: peer_id.clone(),
@@ -225,9 +225,9 @@ impl RelayServer for Server {
 
     async fn doconnect(&self, destination_peer_id: PeerId, source_ip: IpAddr) -> Result<(), Error> {
         if let Some(conn_md) = self.conn_cache.get(&destination_peer_id) {
-            PeerConnection::write_frame_to_stream(
+            RelayConnection::write_frame_to_stream(
                 conn_md.stream.clone(),
-                super::frame::SendingFrames::Command(PeerCommands::DOCONNECT(source_ip)),
+                super::frame::PeerFrames::Command(PeerCommands::DOCONNECT(source_ip)),
             )
             .await?;
         } else {
@@ -246,14 +246,24 @@ impl RelayServer for Server {
 }
 
 #[derive(Clone)]
-pub struct ShareableServerHandle {
+pub struct ShareableServerHandle<F, O>
+where
+    F: Frame<O, frame::Error> + Send + Sync + 'static,
+    O: Operations + Send + Sync + 'static,
+{
     inner: Arc<Server>,
+    _phantom: std::marker::PhantomData<(F, O)>,
 }
 
-impl ShareableServerHandle {
+impl<F, O> ShareableServerHandle<F, O>
+where
+    F: Frame<O, frame::Error> + Send + Sync + 'static,
+    O: Operations + Send + Sync + 'static,
+{
     pub fn init(ip: IpAddr, port: u32) -> Self {
         ShareableServerHandle {
             inner: Arc::new(Server::new(ip, port)),
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -270,7 +280,7 @@ impl ShareableServerHandle {
             let (socket, peer_addr) = listener.accept().await?;
             // let cloned_self = self.clone();
             let connection =
-                PeerConnection::<TcpStream>::new(Arc::new(Mutex::new(BufWriter::new(socket))));
+                RelayConnection::<TcpStream>::new(Arc::new(Mutex::new(BufWriter::new(socket))));
             let server = self.inner.clone();
             tokio::spawn(async move {
                 let _ = process_connection(server, connection, peer_addr).await;
@@ -289,25 +299,25 @@ impl ShareableServerHandle {
 ///
 async fn process_connection(
     server: Arc<Server>,
-    mut connection: PeerConnection<TcpStream>,
+    mut connection: RelayConnection<TcpStream>,
     peer_address: SocketAddr,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     loop {
         match connection.read_frame().await.unwrap() {
             Some(frame) => match frame {
-                RecevingFrames::Register(peer_id) => {
+                RelayFrames::Register(peer_id) => {
                     process_register_frame(&server, &mut connection, peer_address, peer_id).await?;
                 }
-                RecevingFrames::Probe(peer_id) => {
+                RelayFrames::Probe(peer_id) => {
                     process_probe_frame(&server, &mut connection, peer_id).await?
                 }
-                RecevingFrames::DoConnect(peer_id) => {
+                RelayFrames::DoConnect(peer_id) => {
                     process_sync_frame(&server, &mut connection, peer_address, peer_id).await?;
                 }
-                RecevingFrames::Ping => {
+                RelayFrames::Ping => {
                     process_ping_frame(&server, &mut connection).await?;
                 }
-                RecevingFrames::ProbeAck => {
+                RelayFrames::ProbeAck => {
                     // Proble Ack is supposed to be read by Probe method, not here.
                     // This indicates some invalid state
                     error!("Unexpected ProbeAck found");
@@ -324,10 +334,10 @@ async fn process_connection(
 
 async fn process_ping_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection<TcpStream>,
+    connection: &mut RelayConnection<TcpStream>,
 ) -> Result<(), Error> {
     connection
-        .write_frame(super::frame::SendingFrames::PingResult(
+        .write_frame(super::frame::PeerFrames::PingResult(
             server.health_status.clone(),
         ))
         .await?;
@@ -336,21 +346,21 @@ async fn process_ping_frame(
 
 async fn process_sync_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection<TcpStream>,
+    connection: &mut RelayConnection<TcpStream>,
     peer_address: SocketAddr,
     peer_id: PeerId,
 ) -> Result<(), Error> {
     Ok(match server.doconnect(peer_id, peer_address.ip()).await {
         Ok(()) => {
             connection
-                .write_frame(super::frame::SendingFrames::DoConnectResult(
+                .write_frame(super::frame::PeerFrames::DoConnectResult(
                     StatusCodes::SUCCESS,
                 ))
                 .await?;
         }
         Err(_) => {
             connection
-                .write_frame(super::frame::SendingFrames::DoConnectResult(
+                .write_frame(super::frame::PeerFrames::DoConnectResult(
                     StatusCodes::FAILURE,
                 ))
                 .await?;
@@ -360,18 +370,18 @@ async fn process_sync_frame(
 
 async fn process_probe_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection<TcpStream>,
+    connection: &mut RelayConnection<TcpStream>,
     peer_id: PeerId,
 ) -> Result<(), Error> {
     Ok(match server.probe(peer_id).await {
         Ok(peer_info) => {
             connection
-                .write_frame(super::frame::SendingFrames::ProbeResult(Some(peer_info)))
+                .write_frame(super::frame::PeerFrames::ProbeResult(Some(peer_info)))
                 .await?;
         }
         Err(_) => {
             connection
-                .write_frame(super::frame::SendingFrames::ProbeResult(None))
+                .write_frame(super::frame::PeerFrames::ProbeResult(None))
                 .await?;
         }
     })
@@ -379,7 +389,7 @@ async fn process_probe_frame(
 
 async fn process_register_frame(
     server: &Arc<Server>,
-    connection: &mut PeerConnection<TcpStream>,
+    connection: &mut RelayConnection<TcpStream>,
     peer_address: SocketAddr,
     peer_id: PeerId,
 ) -> Result<(), Error> {
@@ -394,14 +404,14 @@ async fn process_register_frame(
         {
             Ok(_) => {
                 connection
-                    .write_frame(super::frame::SendingFrames::RegisterResult(
+                    .write_frame(super::frame::PeerFrames::RegisterResult(
                         StatusCodes::SUCCESS,
                     ))
                     .await?;
             }
             Err(_) => {
                 connection
-                    .write_frame(super::frame::SendingFrames::RegisterResult(
+                    .write_frame(super::frame::PeerFrames::RegisterResult(
                         StatusCodes::FAILURE,
                     ))
                     .await?;

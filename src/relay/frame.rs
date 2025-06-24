@@ -1,4 +1,8 @@
-use std::{fmt::Display, io::Cursor, net::IpAddr};
+use std::{
+    fmt::Display,
+    io::Cursor,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 
@@ -47,14 +51,14 @@ pub trait Operations {
 }
 
 /// API operation
-/// Server accepts only requests starting with these operations.
+/// Relay Server accepts only requests starting with these operations.
 /// Usually every request can be described as
 /// |operation| body  ...
 /// | 1 byte  | n|0 bytes ...
 ///
-/// These operations need to be run in series to make connection succesfully between peers
+/// Multiple operations need to be piped together to create a successful connection between peers
 #[derive(Debug, Clone, PartialEq)]
-pub enum ReceivingOperations {
+pub enum RelayOperations {
     // 01
     // Register peer with server, so that other peers can reach it.
     Register = 01,
@@ -72,28 +76,28 @@ pub enum ReceivingOperations {
     ProbeAck = 05,
 }
 
-impl Operations for ReceivingOperations {
+impl Operations for RelayOperations {
     fn to_u8(&self) -> u8 {
         match self {
-            ReceivingOperations::Register => 01,
-            ReceivingOperations::Probe => 02,
-            ReceivingOperations::DoConnect => 03,
-            ReceivingOperations::Ping => 04,
-            ReceivingOperations::ProbeAck => 05,
+            RelayOperations::Register => 01,
+            RelayOperations::Probe => 02,
+            RelayOperations::DoConnect => 03,
+            RelayOperations::Ping => 04,
+            RelayOperations::ProbeAck => 05,
         }
     }
 }
 
-impl TryFrom<u8> for ReceivingOperations {
+impl TryFrom<u8> for RelayOperations {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            01 => Ok(ReceivingOperations::Register),
-            02 => Ok(ReceivingOperations::Probe),
-            03 => Ok(ReceivingOperations::DoConnect),
-            04 => Ok(ReceivingOperations::Ping),
-            05 => Ok(ReceivingOperations::ProbeAck),
+            01 => Ok(RelayOperations::Register),
+            02 => Ok(RelayOperations::Probe),
+            03 => Ok(RelayOperations::DoConnect),
+            04 => Ok(RelayOperations::Ping),
+            05 => Ok(RelayOperations::ProbeAck),
             _ => Err(Error::Other(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Receiving Operation not supported",
@@ -104,7 +108,7 @@ impl TryFrom<u8> for ReceivingOperations {
 
 /// Operations used by Relay Server to send data to peers, eg. responses
 #[derive(Debug, Clone, PartialEq)]
-pub enum SendingOperations {
+pub enum PeerOperations {
     // ========================== SOURCE PEER ==========================
     // Response status we send to source peer
     // 21
@@ -125,28 +129,28 @@ pub enum SendingOperations {
     Commands = 25,
 }
 
-impl Operations for SendingOperations {
+impl Operations for PeerOperations {
     fn to_u8(&self) -> u8 {
         match self {
-            SendingOperations::RegisterResult => 21,
-            SendingOperations::ProbeResult => 22,
-            SendingOperations::DoConnectResult => 23,
-            SendingOperations::PingResult => 24,
-            SendingOperations::Commands => 25,
+            PeerOperations::RegisterResult => 21,
+            PeerOperations::ProbeResult => 22,
+            PeerOperations::DoConnectResult => 23,
+            PeerOperations::PingResult => 24,
+            PeerOperations::Commands => 25,
         }
     }
 }
 
-impl TryFrom<u8> for SendingOperations {
+impl TryFrom<u8> for PeerOperations {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            21 => Ok(SendingOperations::RegisterResult),
-            22 => Ok(SendingOperations::ProbeResult),
-            23 => Ok(SendingOperations::DoConnectResult),
-            24 => Ok(SendingOperations::PingResult),
-            25 => Ok(SendingOperations::Commands),
+            21 => Ok(PeerOperations::RegisterResult),
+            22 => Ok(PeerOperations::ProbeResult),
+            23 => Ok(PeerOperations::DoConnectResult),
+            24 => Ok(PeerOperations::PingResult),
+            25 => Ok(PeerOperations::Commands),
             _ => Err(Error::Other(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Sending Operation not supported",
@@ -158,7 +162,7 @@ impl TryFrom<u8> for SendingOperations {
 #[derive(Clone, Eq, PartialEq)]
 pub enum StatusCodes {
     SUCCESS = 200,
-    FAILURE = 199,
+    FAILURE = 111,
 }
 
 impl StatusCodes {
@@ -166,6 +170,21 @@ impl StatusCodes {
         match self {
             StatusCodes::SUCCESS => StatusCodes::SUCCESS as u8,
             StatusCodes::FAILURE => StatusCodes::FAILURE as u8,
+        }
+    }
+}
+
+impl TryFrom<u8> for StatusCodes {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            200 => Ok(StatusCodes::SUCCESS),
+            111 => Ok(StatusCodes::FAILURE),
+            _ => Err(Error::Other(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Status Code not supported",
+            ))),
         }
     }
 }
@@ -193,25 +212,26 @@ impl PeerCommands {
     }
 }
 
-pub trait Frame<O, F, E>
+pub trait Frame<O, E>
 where
     O: Operations,
-    F: Frame<O, F, E>,
     E: std::error::Error,
 {
     // Reads operation from buf, and maps it to Operations allowed for that Frame
     fn read_operation(buf: &mut Cursor<&[u8]>) -> Result<O, E>;
 
     // Reads buf, and maps it to Frame of type F
-    fn parse(buf: &mut Cursor<&[u8]>) -> Result<F, E>;
+    fn parse(buf: &mut Cursor<&[u8]>) -> Result<Self, E>
+    where
+        Self: Sized;
 
     // Writes operation and then Frame payload into a vector of bytes
-    fn frame_to_be_bytes(self) -> BytesMut;
+    fn to_be_bytes(self) -> BytesMut;
 }
 
-// Payload for frame received by Relay Server usually requests from peers except ProbeAck which is Response from destination peer
+// Frames sent from Peers to Relay Server
 #[derive(Eq, PartialEq)]
-pub enum RecevingFrames {
+pub enum RelayFrames {
     Register(PeerId),
     Probe(PeerId),
     DoConnect(PeerId),
@@ -219,58 +239,58 @@ pub enum RecevingFrames {
     ProbeAck,
 }
 
-impl Frame<ReceivingOperations, RecevingFrames, Error> for RecevingFrames {
+impl Frame<RelayOperations, Error> for RelayFrames {
     /// Advances cursor by OPERATION_LENGTH bytes
-    fn read_operation(buf: &mut Cursor<&[u8]>) -> Result<ReceivingOperations, Error> {
+    fn read_operation(buf: &mut Cursor<&[u8]>) -> Result<RelayOperations, Error> {
         if !buf.has_remaining() {
             return Err(Error::Incomplete);
         }
 
         // Cursor is advanced by 1 byte here
-        Ok(ReceivingOperations::try_from(buf.get_u8())?)
+        Ok(RelayOperations::try_from(buf.get_u8())?)
     }
 
     /// Advances cusror by Frame length
-    fn parse(buf: &mut Cursor<&[u8]>) -> Result<RecevingFrames, Error> {
+    fn parse(buf: &mut Cursor<&[u8]>) -> Result<RelayFrames, Error> {
         match Self::read_operation(buf)? {
-            ReceivingOperations::Register => Ok(RecevingFrames::Register(PeerId::try_from(buf)?)),
-            ReceivingOperations::Probe => Ok(RecevingFrames::Probe(PeerId::try_from(buf)?)),
-            ReceivingOperations::DoConnect => Ok(RecevingFrames::DoConnect(PeerId::try_from(buf)?)),
-            ReceivingOperations::Ping => Ok(RecevingFrames::Ping),
-            ReceivingOperations::ProbeAck => Ok(RecevingFrames::ProbeAck),
+            RelayOperations::Register => Ok(RelayFrames::Register(PeerId::try_from(buf)?)),
+            RelayOperations::Probe => Ok(RelayFrames::Probe(PeerId::try_from(buf)?)),
+            RelayOperations::DoConnect => Ok(RelayFrames::DoConnect(PeerId::try_from(buf)?)),
+            RelayOperations::Ping => Ok(RelayFrames::Ping),
+            RelayOperations::ProbeAck => Ok(RelayFrames::ProbeAck),
         }
     }
 
-    fn frame_to_be_bytes(self) -> BytesMut {
+    fn to_be_bytes(self) -> BytesMut {
         let mut bytes = BytesMut::with_capacity(1024);
 
         match self {
-            RecevingFrames::Register(peer_id) => {
-                bytes.put_u8(ReceivingOperations::Register.to_u8());
+            RelayFrames::Register(peer_id) => {
+                bytes.put_u8(RelayOperations::Register.to_u8());
                 bytes.extend_from_slice(&peer_id.as_bytes());
             }
-            RecevingFrames::Probe(peer_id) => {
-                bytes.put_u8(ReceivingOperations::Probe.to_u8());
+            RelayFrames::Probe(peer_id) => {
+                bytes.put_u8(RelayOperations::Probe.to_u8());
                 bytes.extend_from_slice(&peer_id.as_bytes());
             }
-            RecevingFrames::DoConnect(peer_id) => {
-                bytes.put_u8(ReceivingOperations::DoConnect.to_u8());
+            RelayFrames::DoConnect(peer_id) => {
+                bytes.put_u8(RelayOperations::DoConnect.to_u8());
                 bytes.extend_from_slice(&peer_id.as_bytes());
             }
-            RecevingFrames::Ping => {
-                bytes.put_u8(ReceivingOperations::Ping.to_u8());
+            RelayFrames::Ping => {
+                bytes.put_u8(RelayOperations::Ping.to_u8());
             }
-            RecevingFrames::ProbeAck => {
-                bytes.put_u8(ReceivingOperations::ProbeAck.to_u8());
+            RelayFrames::ProbeAck => {
+                bytes.put_u8(RelayOperations::ProbeAck.to_u8());
             }
         }
         bytes
     }
 }
 
-// Frames sent to peers, eg. Response frames and Commands to destination peers
+/// Frames sent to peers from Relay Server
 #[derive(Clone, Eq, PartialEq)]
-pub enum SendingFrames {
+pub enum PeerFrames {
     RegisterResult(StatusCodes),
     ProbeResult(Option<PeerInfo>),
     DoConnectResult(StatusCodes),
@@ -278,36 +298,96 @@ pub enum SendingFrames {
     Command(PeerCommands),
 }
 
-impl Frame<SendingOperations, SendingFrames, Error> for SendingFrames {
-    fn read_operation(buf: &mut Cursor<&[u8]>) -> Result<SendingOperations, Error> {
+impl Frame<PeerOperations, Error> for PeerFrames {
+    fn read_operation(buf: &mut Cursor<&[u8]>) -> Result<PeerOperations, Error> {
         if !buf.has_remaining() {
             return Err(Error::Incomplete);
         }
 
         // Cursor is advanced by 1 byte here
-        Ok(SendingOperations::try_from(buf.get_u8())?)
+        Ok(PeerOperations::try_from(buf.get_u8())?)
     }
 
     // TODO
-    fn parse(buf: &mut Cursor<&[u8]>) -> Result<SendingFrames, Error> {
+    fn parse(buf: &mut Cursor<&[u8]>) -> Result<PeerFrames, Error> {
         match Self::read_operation(buf)? {
-            SendingOperations::RegisterResult => todo!(),
-            SendingOperations::ProbeResult => todo!(),
-            SendingOperations::DoConnectResult => todo!(),
-            SendingOperations::PingResult => todo!(),
-            SendingOperations::Commands => todo!(),
+            PeerOperations::RegisterResult => {
+                if !buf.has_remaining() {
+                    return Err(Error::Incomplete);
+                }
+                Ok(PeerFrames::RegisterResult(StatusCodes::try_from(
+                    buf.get_u8(),
+                )?))
+            }
+            PeerOperations::ProbeResult => {
+                if !buf.has_remaining() {
+                    return Err(Error::Incomplete);
+                }
+                let status_code = StatusCodes::try_from(buf.get_u8())?;
+                if status_code == StatusCodes::FAILURE {
+                    return Ok(PeerFrames::ProbeResult(None));
+                }
+                // If status code is SUCCESS, read PeerInfo
+                Ok(PeerFrames::ProbeResult(Some(PeerInfo::try_from(buf)?)))
+            }
+            PeerOperations::DoConnectResult => {
+                if !buf.has_remaining() {
+                    return Err(Error::Incomplete);
+                }
+                Ok(PeerFrames::DoConnectResult(StatusCodes::try_from(
+                    buf.get_u8(),
+                )?))
+            }
+            PeerOperations::PingResult => {
+                if !buf.has_remaining() {
+                    return Err(Error::Incomplete);
+                }
+                Ok(PeerFrames::PingResult(HealthStatus::try_from(
+                    buf.get_u8(),
+                )?))
+            }
+            PeerOperations::Commands => {
+                if !buf.has_remaining() {
+                    return Err(Error::Incomplete);
+                }
+                let command_code = buf.get_u8();
+                match command_code {
+                    SYNC_CODE => Ok(PeerFrames::Command(PeerCommands::SYNC)),
+                    DOCONNECT_CODE => {
+                        if buf.remaining() < 4 {
+                            return Err(Error::Incomplete);
+                        }
+                        // Read 4 bytes for IPv4 address
+                        // If you are using IPv6, you would read 16 bytes instead,
+                        // TODO: Add support for IPv6
+                        // Assuming the IP is in big-endian format
+                        let ip_bytes = buf.get_u32(); // Assuming 4 bytes for IPv4
+                        let ip = IpAddr::from(Ipv4Addr::new(
+                            ((ip_bytes >> 24) & 0xFF) as u8,
+                            ((ip_bytes >> 16) & 0xFF) as u8,
+                            ((ip_bytes >> 8) & 0xFF) as u8,
+                            (ip_bytes & 0xFF) as u8,
+                        ));
+                        Ok(PeerFrames::Command(PeerCommands::DOCONNECT(ip)))
+                    }
+                    _ => Err(Error::Other(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Unknown Peer Command",
+                    ))),
+                }
+            }
         }
     }
 
-    fn frame_to_be_bytes(self) -> BytesMut {
+    fn to_be_bytes(self) -> BytesMut {
         let mut bytes = BytesMut::with_capacity(1024);
         match self {
-            SendingFrames::RegisterResult(status_codes) => {
-                bytes.put_u8(SendingOperations::RegisterResult.to_u8());
+            PeerFrames::RegisterResult(status_codes) => {
+                bytes.put_u8(PeerOperations::RegisterResult.to_u8());
                 bytes.put_u8(status_codes.clone().into_u8());
             }
-            SendingFrames::ProbeResult(peer_info) => {
-                bytes.put_u8(SendingOperations::ProbeResult.to_u8());
+            PeerFrames::ProbeResult(peer_info) => {
+                bytes.put_u8(PeerOperations::ProbeResult.to_u8());
                 if peer_info.is_none() {
                     bytes.put_u8(StatusCodes::FAILURE.into_u8());
                     return bytes;
@@ -319,16 +399,16 @@ impl Frame<SendingOperations, SendingFrames, Error> for SendingFrames {
                 // let peer_info = peer_info.unwrap();
                 bytes.extend_from_slice(peer_info.to_be_bytes().as_ref());
             }
-            SendingFrames::Command(peer_commands) => {
-                bytes.put_u8(SendingOperations::Commands.to_u8());
+            PeerFrames::Command(peer_commands) => {
+                bytes.put_u8(PeerOperations::Commands.to_u8());
                 bytes.extend_from_slice(peer_commands.to_be_bytes().as_ref());
             }
-            SendingFrames::DoConnectResult(status_codes) => {
-                bytes.put_u8(SendingOperations::DoConnectResult.to_u8());
+            PeerFrames::DoConnectResult(status_codes) => {
+                bytes.put_u8(PeerOperations::DoConnectResult.to_u8());
                 bytes.put_u8(status_codes.clone().into_u8());
             }
-            SendingFrames::PingResult(health_status) => {
-                bytes.put_u8(SendingOperations::PingResult.to_u8());
+            PeerFrames::PingResult(health_status) => {
+                bytes.put_u8(PeerOperations::PingResult.to_u8());
                 bytes.put_u8(health_status as u8);
             }
         }
@@ -348,29 +428,29 @@ mod Tests {
     fn test_read_operation_receiving_frame() {
         // Test for each ReceivingOperations variant
         let ops = [
-            (01, ReceivingOperations::Register),
-            (02, ReceivingOperations::Probe),
-            (03, ReceivingOperations::DoConnect),
-            (04, ReceivingOperations::Ping),
+            (01, RelayOperations::Register),
+            (02, RelayOperations::Probe),
+            (03, RelayOperations::DoConnect),
+            (04, RelayOperations::Ping),
         ];
 
         for (byte, expected_op) in ops.iter() {
             let bytes = [*byte as u8];
             let mut buf = Cursor::new(&bytes[..]);
-            let op = RecevingFrames::read_operation(&mut buf).unwrap();
+            let op = RelayFrames::read_operation(&mut buf).unwrap();
             assert_eq!(&op, expected_op);
         }
 
         // Test for incomplete buffer
         let empty: &[u8] = &[];
         let mut empty_buf = Cursor::new(empty);
-        let err = RecevingFrames::read_operation(&mut empty_buf).unwrap_err();
+        let err = RelayFrames::read_operation(&mut empty_buf).unwrap_err();
         matches!(err, Error::Incomplete);
 
         // Test for unsupported operation
         let invalid_bytes: &[u8] = &[0xFF];
         let mut invalid_buf = Cursor::new(invalid_bytes);
-        let err = RecevingFrames::read_operation(&mut invalid_buf).unwrap_err();
+        let err = RelayFrames::read_operation(&mut invalid_buf).unwrap_err();
         matches!(err, Error::Other(_));
     }
 
@@ -380,68 +460,68 @@ mod Tests {
     fn test_read_operation_sending_frame() {
         // Test for each SendingOperations variant
         let ops = [
-            (21, SendingOperations::RegisterResult),
-            (22, SendingOperations::ProbeResult),
-            (23, SendingOperations::DoConnectResult),
-            (24, SendingOperations::PingResult),
-            (25, SendingOperations::Commands),
+            (21, PeerOperations::RegisterResult),
+            (22, PeerOperations::ProbeResult),
+            (23, PeerOperations::DoConnectResult),
+            (24, PeerOperations::PingResult),
+            (25, PeerOperations::Commands),
         ];
 
         for (byte, expected_op) in ops.iter() {
             let bytes = [*byte as u8];
             let mut buf = Cursor::new(&bytes[..]);
-            let op = SendingFrames::read_operation(&mut buf).unwrap();
+            let op = PeerFrames::read_operation(&mut buf).unwrap();
             assert_eq!(&op, expected_op);
         }
 
         // Test for incomplete buffer
         let empty: &[u8] = &[];
         let mut empty_buf = Cursor::new(empty);
-        let err = SendingFrames::read_operation(&mut empty_buf).unwrap_err();
+        let err = PeerFrames::read_operation(&mut empty_buf).unwrap_err();
         matches!(err, Error::Incomplete);
 
         // Test for unsupported operation
         let invalid_bytes: &[u8] = &[0xFF];
         let mut invalid_buf = Cursor::new(invalid_bytes);
-        let err = SendingFrames::read_operation(&mut invalid_buf).unwrap_err();
+        let err = PeerFrames::read_operation(&mut invalid_buf).unwrap_err();
         matches!(err, Error::Other(_));
     }
 
     #[test]
     fn test_to_be_bytes_sending_frame() {
         // Example: RegisterResult with StatusCodes::SUCCESS
-        let operation = SendingOperations::RegisterResult;
-        let frame = SendingFrames::RegisterResult(StatusCodes::SUCCESS);
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::RegisterResult;
+        let frame = PeerFrames::RegisterResult(StatusCodes::SUCCESS);
+        let bytes = frame.to_be_bytes();
         // Should start with operation byte, then frame bytes
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], StatusCodes::SUCCESS.into_u8());
 
         // Example: PingResult with HealthStatus = 1 (assuming HealthStatus is u8)
-        let operation = SendingOperations::PingResult;
-        let frame = SendingFrames::PingResult(HealthStatus::HEALTHY);
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::PingResult;
+        let frame = PeerFrames::PingResult(HealthStatus::HEALTHY);
+        let bytes = frame.to_be_bytes();
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], HealthStatus::HEALTHY as u8);
 
         // Example: Command with PeerCommands::SYNC
-        let operation = SendingOperations::Commands;
-        let frame = SendingFrames::Command(PeerCommands::SYNC);
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::Commands;
+        let frame = PeerFrames::Command(PeerCommands::SYNC);
+        let bytes = frame.to_be_bytes();
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], SYNC_CODE);
 
         // Example: DoConnectResult with StatusCodes::FAILURE
-        let operation = SendingOperations::DoConnectResult;
-        let frame = SendingFrames::DoConnectResult(StatusCodes::FAILURE);
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::DoConnectResult;
+        let frame = PeerFrames::DoConnectResult(StatusCodes::FAILURE);
+        let bytes = frame.to_be_bytes();
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], StatusCodes::FAILURE.into_u8());
 
         // Example: ProbeResult with StatusCodes::SUCCESS and None PeerInfo
-        let operation = SendingOperations::ProbeResult;
-        let frame = SendingFrames::ProbeResult(None);
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::ProbeResult;
+        let frame = PeerFrames::ProbeResult(None);
+        let bytes = frame.to_be_bytes();
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], StatusCodes::FAILURE.into_u8());
         assert_eq!(bytes.len(), 2);
@@ -450,9 +530,9 @@ mod Tests {
         // You may need to construct a valid PeerInfo for your implementation
         // Here we assume PeerInfo::default() exists for demonstration
         let dummy_peer_info = PeerInfo::default(); // Replace with actual PeerInfo if needed
-        let operation = SendingOperations::ProbeResult;
-        let frame = SendingFrames::ProbeResult((Some(dummy_peer_info.clone())));
-        let bytes = frame.frame_to_be_bytes();
+        let operation = PeerOperations::ProbeResult;
+        let frame = PeerFrames::ProbeResult((Some(dummy_peer_info.clone())));
+        let bytes = frame.to_be_bytes();
         assert_eq!(bytes[0], operation as u8);
         assert_eq!(bytes[1], StatusCodes::SUCCESS.into_u8());
         let expected_peer_info_bytes = dummy_peer_info.to_be_bytes();

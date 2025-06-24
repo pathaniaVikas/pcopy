@@ -58,8 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if run_as.to_lowercase() == "relay".to_string() {
         let my_local_ip = local_ip().unwrap();
         let port = 6666;
-        let server = ShareableServerHandle::init(my_local_ip, port);
-        server.run().await?;
+        // let server = ShareableServerHandle::init(my_local_ip, port);
+        // server.run().await?;
         Result::Ok(())
     } else {
         print!("Enter either client/server/relay eg. `cargo run client <folder_path> <ip_address>` OR `cargo run server`");

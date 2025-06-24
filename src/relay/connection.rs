@@ -9,24 +9,27 @@ use tokio::{
 use tracing::info;
 
 use crate::relay::frame::{
-    self, Error, Frame, Operations, ReceivingOperations, RecevingFrames, SendingFrames,
-    SendingOperations,
+    self, Error, Frame, Operations, PeerFrames, PeerOperations, RelayFrames, RelayOperations,
 };
 
-// Steram, Buffer, ReceivingFrame, SendingFrame, Error
-pub trait Connection<S, B, RF, SF, E>
+/// Stream, Buffer, ReceivingFrame, SendingFrame, ReceivingOperations, SendingOperations, Error
+pub trait Connection<S, B, RF, SF, RO, SO, E>
 where
     S: Sync + Send + Clone,
     B: BufMut,
     E: std::error::Error,
+    RO: Operations,
+    SO: Operations,
+    RF: Frame<RO, frame::Error>,
+    SF: Frame<SO, frame::Error>,
 {
     fn new(socket: S) -> Self;
     async fn read_frame(&mut self) -> Result<Option<RF>, E>;
-    async fn write_frame(&mut self, sf: SF) -> Result<(), E>;
+    async fn write_frame(&mut self, frame: SF) -> Result<(), E>;
 }
 
 #[derive(Debug)]
-pub struct PeerConnection<S>
+pub struct RelayConnection<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
 {
@@ -35,35 +38,42 @@ where
 }
 
 impl<S>
-    Connection<Arc<Mutex<BufWriter<S>>>, BytesMut, RecevingFrames, SendingFrames, std::io::Error>
-    for PeerConnection<S>
+    Connection<
+        Arc<Mutex<BufWriter<S>>>,
+        BytesMut,
+        RelayFrames,
+        PeerFrames,
+        RelayOperations,
+        PeerOperations,
+        std::io::Error,
+    > for RelayConnection<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
 {
     fn new(socket: Arc<Mutex<BufWriter<S>>>) -> Self {
-        PeerConnection {
+        RelayConnection {
             stream: socket,
             buffer: BytesMut::with_capacity(1024),
         }
     }
 
-    async fn read_frame(&mut self) -> Result<Option<RecevingFrames>, std::io::Error> {
+    async fn read_frame(&mut self) -> Result<Option<RelayFrames>, std::io::Error> {
         Self::read_frame_from_stream(self.stream.clone(), &mut self.buffer).await
     }
 
-    async fn write_frame(&mut self, sf: SendingFrames) -> Result<(), std::io::Error> {
-        Self::write_frame_to_stream(self.stream.clone(), sf).await
+    async fn write_frame(&mut self, frame: PeerFrames) -> Result<(), std::io::Error> {
+        Self::write_frame_to_stream(self.stream.clone(), frame).await
     }
 }
 
-impl<S> PeerConnection<S>
+impl<S> RelayConnection<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
 {
     pub async fn read_frame_from_stream(
         stream: Arc<Mutex<BufWriter<S>>>,
         mut buffer: &mut BytesMut,
-    ) -> Result<Option<RecevingFrames>, std::io::Error> {
+    ) -> Result<Option<RelayFrames>, std::io::Error> {
         loop {
             if let Some(frame) = Self::parse_frame(&buffer)? {
                 info!("*** Found frame in stream");
@@ -96,9 +106,9 @@ where
         }
     }
 
-    fn parse_frame(buffer: &BytesMut) -> Result<Option<RecevingFrames>, std::io::Error> {
+    fn parse_frame(buffer: &BytesMut) -> Result<Option<RelayFrames>, std::io::Error> {
         let mut buf = Cursor::new(&buffer[..]);
-        match RecevingFrames::parse(&mut buf) {
+        match RelayFrames::parse(&mut buf) {
             Ok(frame) => {
                 info!("*** Successfully parsed frame");
                 return Ok(Some(frame));
@@ -110,10 +120,107 @@ where
 
     pub async fn write_frame_to_stream(
         stream: Arc<Mutex<BufWriter<S>>>,
-        frame: SendingFrames,
+        frame: PeerFrames,
     ) -> Result<(), std::io::Error> {
         let mut lock = stream.lock().await;
-        lock.write_all(&frame.frame_to_be_bytes()).await?;
+        lock.write_all(&frame.to_be_bytes()).await?;
+        lock.flush().await?;
+        drop(lock);
+        Ok(())
+    }
+}
+
+pub struct PeerConnection<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+{
+    pub stream: Arc<Mutex<BufWriter<S>>>,
+    buffer: BytesMut,
+}
+
+impl<S>
+    Connection<
+        Arc<Mutex<BufWriter<S>>>,
+        BytesMut,
+        PeerFrames,
+        RelayFrames,
+        PeerOperations,
+        RelayOperations,
+        std::io::Error,
+    > for PeerConnection<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+{
+    fn new(socket: Arc<Mutex<BufWriter<S>>>) -> Self {
+        PeerConnection {
+            stream: socket,
+            buffer: BytesMut::with_capacity(1024),
+        }
+    }
+
+    async fn read_frame(&mut self) -> Result<Option<PeerFrames>, std::io::Error> {
+        Self::read_frame_from_stream(self.stream.clone(), &mut self.buffer).await
+    }
+
+    async fn write_frame(&mut self, frame: RelayFrames) -> Result<(), std::io::Error> {
+        Self::write_frame_to_stream(self.stream.clone(), frame).await
+    }
+}
+
+impl<S> PeerConnection<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+{
+    pub async fn read_frame_from_stream(
+        stream: Arc<Mutex<BufWriter<S>>>,
+        mut buffer: &mut BytesMut,
+    ) -> Result<Option<PeerFrames>, std::io::Error> {
+        loop {
+            if let Some(frame) = Self::parse_frame(&buffer)? {
+                info!("*** Found frame in stream");
+                return Ok(Some(frame));
+            }
+            // There is not enough buffered data to read a frame. Attempt to
+            // read more data from the socket.
+            info!("*** Reading from stream");
+            if 0 == stream.lock().await.read(&mut buffer).await? {
+                // The remote closed the connection. For this to be a clean
+                // shutdown, there should be no data in the read buffer. If
+                // there is, this means that the peer closed the socket while
+                // sending a frame.
+                if buffer.is_empty() {
+                    info!("*** Stream got closed");
+                    return Ok(None);
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "connection reset by peer",
+                    ));
+                }
+            } else {
+                info!("REad more than 0 bytes")
+            }
+        }
+    }
+
+    fn parse_frame(buffer: &BytesMut) -> Result<Option<PeerFrames>, std::io::Error> {
+        let mut buf = Cursor::new(&buffer[..]);
+        match PeerFrames::parse(&mut buf) {
+            Ok(frame) => {
+                info!("*** Successfully parsed frame");
+                return Ok(Some(frame));
+            }
+            Err(Error::Incomplete) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    async fn write_frame_to_stream(
+        stream: Arc<Mutex<BufWriter<S>>>,
+        frame: RelayFrames,
+    ) -> Result<(), std::io::Error> {
+        let mut lock = stream.lock().await;
+        lock.write_all(&frame.to_be_bytes()).await?;
         lock.flush().await?;
         drop(lock);
         Ok(())
@@ -124,7 +231,7 @@ where
 mod tests {
     use super::*;
     use crate::relay::frame::{
-        PeerCommands, ReceivingOperations, RecevingFrames, SendingFrames, StatusCodes,
+        PeerCommands, PeerFrames, RelayFrames, RelayOperations, StatusCodes,
     };
     use crate::relay::peer::PeerId;
     use bytes::BytesMut;
@@ -145,9 +252,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_frame_to_stream() {
         let (stream, mut server) = dummy_stream().await;
-        let frame = SendingFrames::RegisterResult(StatusCodes::SUCCESS);
+        let frame = PeerFrames::RegisterResult(StatusCodes::SUCCESS);
 
-        PeerConnection::<DuplexStream>::write_frame_to_stream(stream.clone(), frame)
+        RelayConnection::<DuplexStream>::write_frame_to_stream(stream.clone(), frame)
             .await
             .expect("write_frame_to_stream should succeed");
 
@@ -158,7 +265,7 @@ mod tests {
         // The first byte should be the operation code for RegisterResult
         assert_eq!(
             buf[0],
-            crate::relay::frame::SendingOperations::RegisterResult as u8
+            crate::relay::frame::PeerOperations::RegisterResult as u8
         );
         // The second byte should be the StatusCodes::SUCCESS as u8
         assert_eq!(buf[1], StatusCodes::SUCCESS.into_u8());
@@ -169,14 +276,14 @@ mod tests {
         tracing_subscriber::fmt::try_init().ok();
         // Prepare a buffer with a valid ReceivingOperation (e.g., Ping)
         let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&[ReceivingOperations::Ping as u8]);
+        buffer.extend_from_slice(&[RelayOperations::Ping as u8]);
         // You may need to extend with more bytes if RecevingFrames::parse expects more
 
-        let result = PeerConnection::<DuplexStream>::parse_frame(&buffer);
+        let result = RelayConnection::<DuplexStream>::parse_frame(&buffer);
         assert!(result.is_ok());
         let frame = result.unwrap();
         // If parse returns Some, check the variant
-        if let Some(RecevingFrames::Ping) = frame {
+        if let Some(RelayFrames::Ping) = frame {
             // Success
         } else {
             panic!("Expected RecevingFrames::Ping");
@@ -187,7 +294,7 @@ mod tests {
     async fn test_parse_frame_incomplete() {
         // Prepare an empty buffer
         let buffer = BytesMut::new();
-        let result = PeerConnection::<DuplexStream>::parse_frame(&buffer);
+        let result = RelayConnection::<DuplexStream>::parse_frame(&buffer);
         // Should be Ok(None) for incomplete
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -198,7 +305,7 @@ mod tests {
         // Prepare a buffer with an invalid operation byte
         let mut buffer = BytesMut::new();
         buffer.extend_from_slice(&[0xFF]); // 0xFF is not a valid ReceivingOperations
-        let result = PeerConnection::<DuplexStream>::parse_frame(&buffer);
+        let result = RelayConnection::<DuplexStream>::parse_frame(&buffer);
         assert!(result.is_err());
     }
 
@@ -208,12 +315,12 @@ mod tests {
         // You may need to adjust the payload depending on your RecevingFrames::parse implementation
         let peer_id = PeerId::default(); // Example PeerId bytes
         let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&[ReceivingOperations::Register as u8]);
+        buffer.extend_from_slice(&[RelayOperations::Register as u8]);
         buffer.extend_from_slice(&peer_id.as_bytes());
         assert!(buffer.len() >= 65); // Ensure buffer has enough bytes for operation + peer_id
-        let result = PeerConnection::<DuplexStream>::parse_frame(&buffer);
+        let result = RelayConnection::<DuplexStream>::parse_frame(&buffer);
         assert!(result.is_ok());
-        if let Some(RecevingFrames::Register(_peer_id)) = result.unwrap() {
+        if let Some(RelayFrames::Register(_peer_id)) = result.unwrap() {
             // Optionally check peer_id bytes here
         } else {
             panic!("Expected RecevingFrames::Register");
@@ -225,12 +332,12 @@ mod tests {
         // Prepare a buffer for a Probe frame
         let peer_id = PeerId::default(); // Example PeerId bytes
         let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&[ReceivingOperations::Probe as u8]);
+        buffer.extend_from_slice(&[RelayOperations::Probe as u8]);
         buffer.extend_from_slice(&peer_id.as_bytes());
         assert!(buffer.len() >= 65); // Ensure buffer has enough bytes for operation + peer_id
-        let result = PeerConnection::<DuplexStream>::parse_frame(&buffer);
+        let result = RelayConnection::<DuplexStream>::parse_frame(&buffer);
         assert!(result.is_ok());
-        if let Some(RecevingFrames::Probe(_peer_id)) = result.unwrap() {
+        if let Some(RelayFrames::Probe(_peer_id)) = result.unwrap() {
             // Optionally check peer_id bytes here
         } else {
             panic!("Expected RecevingFrames::Probe");
