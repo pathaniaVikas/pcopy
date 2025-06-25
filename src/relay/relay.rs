@@ -17,6 +17,7 @@ use crate::relay::{
     cache::Cache,
     connection::{Connection, RelayConnection},
     frame::{self, Frame, Operations, PeerCommands, RelayFrames, StatusCodes},
+    framehelper,
     peer::{PeerConnectionMetadata, PeerId, PeerInfo},
 };
 
@@ -174,13 +175,13 @@ impl RelayServer for Server {
     async fn probe(&self, peer_id: PeerId) -> Result<PeerInfo, Error> {
         if let Some(conn_md) = self.conn_cache.get(&peer_id) {
             let start = Instant::now();
-            RelayConnection::write_frame_to_stream(
+            framehelper::write_frame_given_stream(
                 conn_md.stream.clone(),
                 super::frame::PeerFrames::Command(PeerCommands::SYNC),
             )
             .await?;
             let mut buffer = BytesMut::with_capacity(PROBE_ACK_LENGTH);
-            match RelayConnection::read_frame_from_stream(conn_md.stream.clone(), &mut buffer)
+            match framehelper::read_frame_given_stream(conn_md.stream.clone(), &mut buffer)
                 .await
                 .unwrap()
             {
@@ -225,7 +226,7 @@ impl RelayServer for Server {
 
     async fn doconnect(&self, destination_peer_id: PeerId, source_ip: IpAddr) -> Result<(), Error> {
         if let Some(conn_md) = self.conn_cache.get(&destination_peer_id) {
-            RelayConnection::write_frame_to_stream(
+            framehelper::write_frame_given_stream(
                 conn_md.stream.clone(),
                 super::frame::PeerFrames::Command(PeerCommands::DOCONNECT(source_ip)),
             )

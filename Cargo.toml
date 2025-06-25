@@ -16,6 +16,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 local-ip-address = "0.6"
 dashmap = "6.0.0"
 rand = "0.9.1"
+base64 = "0.22.0"
 
 [[bench]]
 name = "localtransfer"

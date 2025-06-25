@@ -10,6 +10,7 @@ use byteorder::ReadBytesExt;
 use bytes::Buf;
 use rand::{rand_core::le, RngCore};
 use tokio::{io::BufWriter, net::TcpStream, sync::Mutex};
+use tracing::info;
 
 use crate::relay::{frame, relay};
 
@@ -64,9 +65,7 @@ impl TryFrom<&mut std::io::Cursor<&[u8]>> for PeerId {
     type Error = frame::Error;
 
     fn try_from(value: &mut std::io::Cursor<&[u8]>) -> Result<Self, Self::Error> {
-        let remaining_bytes_to_read = value.get_ref().len() - value.position() as usize;
-
-        if remaining_bytes_to_read < PEER_ID_LENGTH_BYTES {
+        if value.remaining() < PEER_ID_LENGTH_BYTES {
             return Err(frame::Error::Incomplete);
         }
 
@@ -138,9 +137,7 @@ impl TryFrom<&mut Cursor<&[u8]>> for PeerInfo {
     type Error = frame::Error;
 
     fn try_from(value: &mut Cursor<&[u8]>) -> Result<Self, Self::Error> {
-        let remaining_bytes_to_read = value.get_ref().len() - value.position() as usize;
-
-        if remaining_bytes_to_read < PEER_INFO_SERIALIZE_BYTES_LEN {
+        if value.remaining() < PEER_INFO_SERIALIZE_BYTES_LEN {
             return Err(frame::Error::Incomplete);
         }
 

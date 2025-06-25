@@ -9,18 +9,20 @@ use tokio::{
 };
 
 use crate::relay::{
-    connection::{Connection, RelayConnection},
-    frame::{Frame, PeerFrames, RelayFrames},
-    peer::PeerId,
+    connection::{Connection, PeerConnection, RelayConnection},
+    frame::{Frame, PeerFrames, RelayFrames, StatusCodes},
+    peer::{PeerId, PeerInfo},
 };
 
 pub struct Sender {
-    relay_conn: RelayConnection<TcpStream>,
+    peer_conn: PeerConnection<TcpStream>,
 }
 
 impl Sender {
-    pub fn new(relay_conn: RelayConnection<TcpStream>) -> Self {
-        Sender { relay_conn }
+    pub fn new(peer_connection: PeerConnection<TcpStream>) -> Self {
+        Sender {
+            peer_conn: peer_connection,
+        }
     }
 
     // Returns a TcpStream connected to the peer
@@ -31,14 +33,84 @@ impl Sender {
     ) -> Result<TcpStream, Error> {
         // Logic to connect to a peer
 
+        // ------------------------------------------------------------------------------------------
+        // 1. REGISTER
+        // ------------------------------------------------------------------------------------------
         // Create Register Request Frame
-        let register_request_frame = RelayFrames::Register(source_peer_id);
+        let register_frame = RelayFrames::Register(source_peer_id);
         // Send Register Request Frame to Relay
-        // self.relay_conn
-        //     .write_frame(RelayFrames::Register(source_peer_id))
-        //     .await?;
-        // Wait for Register Response Frame from Relay
-        let frame = self.relay_conn.read_frame().await?;
+        self.peer_conn.write_frame(register_frame).await?;
+
+        // Wait for Register Response Frame from Relay, or error
+        loop {
+            match self.peer_conn.read_frame().await {
+                Ok(frame_option) => match frame_option {
+                    Some(f) => match f {
+                        PeerFrames::RegisterResult(status_codes) => {
+                            if status_codes == StatusCodes::SUCCESS {
+                                break;
+                            } else {
+                                return Err(Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "Peer Registeration failed with Relay Server",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid Registeration response from Relay Server. ",
+                            ));
+                        }
+                    },
+                    None => {
+                        continue;
+                    }
+                },
+                Err(e) => return Err(Error::new(std::io::ErrorKind::ConnectionReset, e)),
+            }
+        }
+
+        // ------------------------------------------------------------------------------------------
+        // 2. PROBE PEER
+        // ------------------------------------------------------------------------------------------
+        let probe_frame = RelayFrames::Probe(destination_peer_id);
+        self.peer_conn.write_frame(probe_frame).await?;
+
+        let mut peer_info: Option<PeerInfo> = None;
+
+        // Wait for Register Response Frame from Relay, or error
+        loop {
+            match self.peer_conn.read_frame().await {
+                Ok(frame_option) => match frame_option {
+                    Some(f) => match f {
+                        PeerFrames::ProbeResult(peer_info_option) => match peer_info_option {
+                            Some(pi) => {
+                                peer_info = Some(pi);
+                                break;
+                            }
+                            None => {
+                                return Err(Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "Peer Info Not found in Relay Server",
+                                ));
+                            }
+                        },
+                        _ => {
+                            return Err(Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid Probe response from Relay Server. ",
+                            ));
+                        }
+                    },
+                    None => {
+                        continue;
+                    }
+                },
+                Err(e) => return Err(Error::new(std::io::ErrorKind::ConnectionReset, e)),
+            }
+        }
+
         let ip = local_ip().map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         let addr = (ip, 8080); // Replace 8080 with the actual port you want to connect to
         let stream = TcpStream::connect(addr).await?;
